@@ -1,0 +1,24 @@
+# Copy to config/nightshift.toml to override defaults.
+# Paths are relative to the Nightshift root (the process working directory,
+# or the directory passed as --root). Do not put secrets in this file.
+
+schema_version = 1
+
+[paths]
+state_dir = "state"
+runs_dir = "runs"
+worktrees_dir = "worktrees"
+
+[supervisor]
+concurrency = 1
+poll_interval_seconds = 2
+
+[provider]
+default = "grok"
+max_turns = 40
+# dontAsk plus explicit allow/deny rules. bypassPermissions is refused.
+permission_mode = "dontAsk"
+
+[policy]
+# Failed and cancelled worktrees are kept unless this is true.
+destroy_failed_worktrees = false

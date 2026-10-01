@@ -1,0 +1,23 @@
+schema_version = 1
+id = "repo-audit-example"
+description = "Harmless read-only audit skeleton. Replace repository before queueing."
+type = "audit"
+
+repository = "REPLACE_WITH_REPOSITORY_PATH"
+base_ref = "HEAD"
+
+provider = "fake"
+max_runtime_seconds = 600
+max_attempts = 1
+concurrency_group = "repo-audit-example"
+
+network = false
+write_scope = "none"
+
+expected_artifacts = []
+success_criteria = [
+  "The source checkout is unchanged.",
+  "The morning report names the original revision.",
+]
+
+verification = []

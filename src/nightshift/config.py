@@ -1,0 +1,103 @@
+"""Runtime paths and optional TOML configuration.
+
+Relative path settings resolve against the Nightshift root. The root is
+``--root``, then ``NIGHTSHIFT_ROOT``, then the process working directory.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import tomllib
+
+from nightshift.models import UsageError
+
+
+@dataclass(frozen=True)
+class Config:
+    root: Path
+    state_dir: Path
+    runs_dir: Path
+    worktrees_dir: Path
+    db_path: Path
+    concurrency: int = 1
+    poll_interval_seconds: float = 2.0
+    default_provider: str = "grok"
+    max_turns: int = 40
+    permission_mode: str = "dontAsk"
+    destroy_failed_worktrees: bool = False
+
+    def ensure_dirs(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+
+def load_config(root: Path | None = None, config_path: Path | None = None) -> Config:
+    env_root = os.environ.get("NIGHTSHIFT_ROOT")
+    chosen_root = (root or (Path(env_root) if env_root else Path.cwd())).expanduser().resolve()
+    path = _discover_config(chosen_root, config_path)
+    data: dict = {}
+    if path is not None:
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise UsageError(f"invalid config {path}: {exc}") from exc
+    paths = data.get("paths") or {}
+    supervisor = data.get("supervisor") or {}
+    provider = data.get("provider") or {}
+    policy = data.get("policy") or {}
+    state_dir = _under_root(chosen_root, paths.get("state_dir") or "state")
+    runs_dir = _under_root(chosen_root, paths.get("runs_dir") or "runs")
+    worktrees_dir = _under_root(chosen_root, paths.get("worktrees_dir") or "worktrees")
+    concurrency = int(supervisor.get("concurrency", 1))
+    if concurrency < 1:
+        raise UsageError("supervisor.concurrency must be >= 1")
+    poll = float(supervisor.get("poll_interval_seconds", 2))
+    if poll <= 0:
+        raise UsageError("supervisor.poll_interval_seconds must be > 0")
+    permission_mode = str(provider.get("permission_mode", "dontAsk"))
+    if permission_mode in {"bypassPermissions", "always-approve", "always_approve"}:
+        raise UsageError(
+            "refusing permission_mode that bypasses approvals; v0.1 uses dontAsk plus deny rules"
+        )
+    return Config(
+        root=chosen_root,
+        state_dir=state_dir,
+        runs_dir=runs_dir,
+        worktrees_dir=worktrees_dir,
+        db_path=state_dir / "nightshift.db",
+        concurrency=concurrency,
+        poll_interval_seconds=poll,
+        default_provider=str(provider.get("default", "grok")),
+        max_turns=int(provider.get("max_turns", 40)),
+        permission_mode=permission_mode,
+        destroy_failed_worktrees=bool(policy.get("destroy_failed_worktrees", False)),
+    )
+
+
+def _discover_config(root: Path, explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        path = explicit.expanduser().resolve()
+        if not path.is_file():
+            raise UsageError(f"config not found: {path}")
+        return path
+    env = os.environ.get("NIGHTSHIFT_CONFIG")
+    if env:
+        path = Path(env).expanduser().resolve()
+        if not path.is_file():
+            raise UsageError(f"config not found: {path}")
+        return path
+    for candidate in (root / "config" / "nightshift.toml", root / "nightshift.toml"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _under_root(root: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
