@@ -75,7 +75,7 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
                     False,
                 )
             return RecoveryDecision(
-                "process_gone_workspace_intact",
+                "process_gone_workspace_missing",
                 "mark",
                 RunState.FAILED.value,
                 "process gone and workspace missing",

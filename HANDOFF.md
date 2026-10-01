@@ -87,7 +87,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 Result:
 
 ```text
-Ran 34 tests in 9.598s
+Ran 34 tests in 9.815s
 OK
 ```
 
@@ -111,12 +111,12 @@ Two FakeProvider `nightshift run` invocations, each against its own throwaway ro
 
 | Run | State | Attempt | Source HEAD before and after | Porcelain |
 | --- | --- | --- | --- | --- |
-| `ns-a156addb6add` | SUCCEEDED | 1 | `9e9e5135f44f150a586b6860d9c3d12d6187db3c` | `?? DIRTY.txt` unchanged |
-| `ns-3d8b00ae5f8f` | SUCCEEDED | 1 | `a6abd9f9d2ec843ed037ca18dd9a34353ad0c988` | `?? DIRTY.txt` unchanged |
+| `ns-0b571bdadc2b` | SUCCEEDED | 1 | `681bd8ed446af7e005192896b9e6dc9208662d55` | `?? DIRTY.txt` unchanged |
+| `ns-f07b49e876c6` | SUCCEEDED | 1 | `253e09351bfefb1ba056ccd9e410793df0877fe4` | `?? DIRTY.txt` unchanged |
 
 Each run directory contained `metadata.json`, `prompt.final.md`, `provider.stdout.log`, `provider.stderr.log`, `events.jsonl`, `verification.log`, and `report.md`. Each report named that repository and the original revision, recorded local commit `nightshift: record fake provider note`, and set `Human review required: yes`.
 
-`nightshift recover` on a `RUNNING` row whose PID was dead (`999999`) and whose workspace directory still existed printed `INTERRUPTED process_gone_workspace_intact attempt=1` and did not launch a provider. `nightshift cancel` on a queued run printed `CANCELLED`. `queue list`, `status`, `logs`, and `report` showed those run ids and outcomes.
+`nightshift recover` on a `RUNNING` row whose PID was dead (`999999`) and whose workspace directory still existed printed `ns-d24f0e11027e INTERRUPTED process_gone_workspace_intact attempt=1` and did not launch a provider. A dead `RUNNING` row whose workspace path is missing is classified `process_gone_workspace_missing`, marked `FAILED`, and also does not launch a provider. `nightshift cancel` on a queued run printed `cancel ns-b8637dfff155 CANCELLED`. `queue list`, `status`, `logs`, and `report` showed those run ids and outcomes.
 
 ## Safety guarantees
 

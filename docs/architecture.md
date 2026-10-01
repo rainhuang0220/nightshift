@@ -70,7 +70,7 @@ Timestamps are UTC with microseconds so two inserts in the same second keep queu
 | Preparing or running, matching process alive | `process_still_alive` | left as-is |
 | Preparing, process gone | `interrupted_before_launch` | `INTERRUPTED` |
 | Running, process gone, no provider exit, workspace present | `process_gone_workspace_intact` | `INTERRUPTED` |
-| Running, process gone, workspace missing | `process_gone_workspace_intact` | `FAILED` |
+| Running, process gone, workspace missing | `process_gone_workspace_missing` | `FAILED` |
 | Provider exit recorded, verification not run | `verification_never_ran` | verification only |
 | Provider exit and verification already recorded | `provider_exited` | finalize from recorded codes |
 

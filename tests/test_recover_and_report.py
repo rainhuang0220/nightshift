@@ -272,6 +272,34 @@ class RecoverTests(unittest.TestCase):
             self.assertFalse(applied.launch_provider)
             self.assertFalse((workspace / "nightshift-notes").exists())
 
+            missing_path = root / "missing-workspace"
+            self.assertFalse(missing_path.exists())
+            missing = db.insert_run(
+                empty_run(
+                    job_id="missing",
+                    provider="fake",
+                    state=RunState.RUNNING.value,
+                    attempt=1,
+                    max_attempts=2,
+                    pid=dead.pid,
+                    process_meta={"match": "nightshift-not-running", "pid": dead.pid},
+                    job_snapshot=_job_snapshot(),
+                    workspace_path=str(missing_path),
+                    source_repo=str(workspace),
+                    source_revision="unused",
+                    run_dir=str(config.runs_dir / "missing"),
+                    provider_exit_code=None,
+                )
+            )
+            updated, applied = recover_run(config, db, locks, missing.run_id)
+            self.assertEqual(applied.classification, "process_gone_workspace_missing")
+            self.assertNotIn("intact", applied.classification)
+            self.assertEqual(updated.state, RunState.FAILED.value)
+            self.assertEqual(updated.recovery_class, "process_gone_workspace_missing")
+            self.assertEqual(updated.attempt, 1)
+            self.assertFalse(applied.launch_provider)
+            self.assertFalse(missing_path.exists())
+
             before = db.insert_run(
                 empty_run(
                     job_id="before",
