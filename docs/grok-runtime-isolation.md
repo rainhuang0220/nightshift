@@ -17,13 +17,15 @@ That stops automatic discovery of user-level directories that live under the nor
 Nightshift does not copy:
 
 - the operator's `config.toml`
-- skills
+- the operator's skills
 - plugins or marketplaces
 - hooks
 - MCP credentials or MCP definitions
 - memory
 - the operator's `AGENTS.md`
-- normal sessions
+- the operator's sessions
+
+The CLI itself, on the first `grok inspect` or launch against that `GROK_HOME`, materializes its own bundled skills, bundled agents, docs, and a generated config into the profile. On this machine that bundle is 22 skills, all with source type `bundled` and paths under the profile. Operator hooks, plugins, and MCP servers stay at zero. The extension audit accepts a bundled skill only when its path is under this profile. It rejects user, project, and plugin skills. The profile directory stays mode 0700. `auth.json` stays mode 0600. The materialized tree is gitignored with `state/`.
 
 The child also receives `GROK_MEMORY=0` and `GROK_WORKFLOWS=0`.
 
@@ -128,11 +130,11 @@ A clean sacrificial probe therefore reports `PASS_WITH_LIMITATIONS`. `PASS` woul
 Counts, not paths:
 
 - hooks 0
-- skills 0, unless a future change intentionally installs a skill under `state/grok-profile`
 - plugins 0
 - MCP servers 0
 - operator-global instructions 0
 - builtin agents only
+- skills: the CLI's bundled set, paths under `state/grok-profile`, and no user, project, or plugin skills
 - permission sources empty and permissions loaded 0
 
 The operator's normal inspect is a different process, with the operator's home and the operator's `GROK_HOME`. Those counts must not appear in the Nightshift child. The safety probe checks that, and a mismatch blocks the launch.
