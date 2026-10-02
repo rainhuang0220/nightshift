@@ -476,6 +476,25 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(failed, "FAIL")
         self.assertEqual(ok, "PASS_WITH_LIMITATIONS")
 
+    def test_real_probe_uses_the_launch_audit_not_the_restored_clone(self) -> None:
+        from nightshift.probe import recorded_launch_audit
+
+        ok, counts, moved = recorded_launch_audit(
+            "grok",
+            {
+                "extension_audit": {"ok": True, "counts": {"mcp_servers": 0, "hooks": 0}},
+                "neutralized": [".grok", ".mcp.json"],
+            },
+        )
+        self.assertTrue(ok)
+        self.assertEqual(counts["mcp_servers"], 0)
+        self.assertEqual(moved, [".grok", ".mcp.json"])
+        restored_would_fail, _, _ = recorded_launch_audit(
+            "grok",
+            {"extension_audit": {"ok": True, "counts": {}}, "neutralized": []},
+        )
+        self.assertFalse(restored_would_fail)
+
     def test_streaming_json_text_events_are_summarized(self) -> None:
         from nightshift.report import summarize_stream
 

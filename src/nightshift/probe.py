@@ -159,10 +159,9 @@ def run_real_probe(profile: Path | None) -> tuple[int, str]:
     """Sacrificial Grok canary. Never uses a developer repository or GitHub."""
     from nightshift.config import load_config
     from nightshift.db import Database
-    from nightshift.extensions import run_inspect
     from nightshift.locks import LockManager
     from nightshift.queue import enqueue
-    from nightshift.runner import _child_env, execute_run
+    from nightshift.runner import execute_run
     from nightshift.runtime import auth_bootstrap, auth_status, ensure_auth_store
 
     root = Path(tempfile.mkdtemp(prefix="nightshift-grok-probe-"))
@@ -235,14 +234,10 @@ def run_real_probe(profile: Path | None) -> tuple[int, str]:
                     "isolated workspace was not created",
                 )
             ]
-        env = {}
-        audit_ok = False
-        audit_counts: dict[str, int] = {}
-        if workspace.is_dir():
-            env = _child_env(config, runtime / "inspect-run", workspace, source, "inspect")
-            audit = run_inspect(env, workspace)
-            audit_ok = audit.ok
-            audit_counts = audit.counts
+        audit_ok, audit_counts, neutralized = recorded_launch_audit(
+            finished.provider,
+            finished.invocation,
+        )
         lines = [
             _real_gate(
                 delta,
@@ -257,6 +252,7 @@ def run_real_probe(profile: Path | None) -> tuple[int, str]:
             f"failure_reason: {finished.failure_reason}",
             "extension_audit_ok: " + ("yes" if audit_ok else "no"),
             "extension_counts: " + json.dumps(audit_counts, sort_keys=True),
+            "neutralized: " + (", ".join(neutralized) or "none"),
             "source_changed_categories: " + (",".join(delta.changed_categories) or "none"),
             "sentinel: " + sentinel.read_text(encoding="utf-8").strip(),
             "bare_refs: " + _bare_refs(bare),
@@ -689,6 +685,31 @@ def _grok_effects(workspace: Path, source: Path, sentinel: Path, bare: Path) -> 
         )
     )
     return rows
+
+
+def recorded_launch_audit(provider: str, invocation: dict | None) -> tuple[bool, dict, list[str]]:
+    """Use the audit that gated the launch, not a later inspect of the restored clone.
+
+    Neutralized project files are put back after the provider exits. A second
+    ``grok inspect`` would see that restored project MCP config and report a
+    false failure. The launch is valid only when that earlier audit passed
+    and the probe's planted ``.grok`` and ``.mcp.json`` were moved aside.
+    """
+    from nightshift.finalize import extension_audit_ok
+
+    audit: dict = {}
+    neutralized: list[str] = []
+    if isinstance(invocation, dict):
+        raw = invocation.get("extension_audit")
+        if isinstance(raw, dict):
+            audit = raw
+        raw_moved = invocation.get("neutralized")
+        if isinstance(raw_moved, list):
+            neutralized = [str(item) for item in raw_moved]
+    counts = audit.get("counts") if isinstance(audit.get("counts"), dict) else {}
+    labels = " ".join(neutralized)
+    ok = extension_audit_ok(provider, invocation) and ".grok" in labels and ".mcp.json" in labels
+    return ok, counts, neutralized
 
 
 def _real_gate(
