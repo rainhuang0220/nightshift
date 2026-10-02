@@ -84,7 +84,7 @@ A failed audit is `BLOCKED_EXTENSION_SURFACE`. The model is not launched.
 
 ### 10. Isolated HOME and GROK_HOME
 
-**Containment of extensions and credentials.** The child `HOME` is `runs/<run-id>/runtime-home`, mode 0700. `GROK_HOME` is `runs/<run-id>/grok-home`, created for that run and not reused. The persistent auth file is `state/credentials/grok/auth.json` (parent mode 0700, file mode 0600). A provider launch copies only that file into the per-run home. Verification recovery does not copy it. Exit, cancel, interrupt, and recovery delete the copy and leave the store. `TMPDIR` is a private directory under the run. The operator's `~/.agents`, `~/.claude`, `~/.cursor`, skills, plugins, hooks, MCP definitions, memory, and sessions are not copied. Details are in `docs/grok-runtime-isolation.md`.
+**Containment of extensions and credentials.** The child `HOME` is `runs/<run-id>/runtime-home`, mode 0700. `GROK_HOME` is `runs/<run-id>/grok-home`, created for that run and not reused. The persistent auth file is `state/credentials/grok/auth.json` (parent mode 0700, file mode 0600). A provider launch copies only that file into the per-run home. The copy is removed before verification. Verification recovery does not copy it. Exit, cancel, interrupt, and recovery delete the copy and leave the store. `TMPDIR` is a private directory under the run. The operator's `~/.agents`, `~/.claude`, `~/.cursor`, skills, plugins, hooks, MCP definitions, memory, and sessions are not copied. Details are in `docs/grok-runtime-isolation.md`.
 
 ### 11. Environment minimization
 

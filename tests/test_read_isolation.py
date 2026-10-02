@@ -432,6 +432,46 @@ class RuntimeProfileTests(unittest.TestCase):
             self.assertFalse((home / "auth.json").exists())
             self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
 
+    def test_happy_path_verification_cannot_read_per_run_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            operator = root / "operator"
+            operator.mkdir()
+            (operator / "auth.json").write_bytes(b"synthetic-auth-material")
+            source = root / "source"
+            make_repo(source)
+            job_dir = root / "job"
+            write_job(
+                job_dir,
+                source,
+                provider="fake",
+                write_scope="none",
+                network=False,
+                expected_artifacts=[],
+                success_criteria=["Verification does not see the auth copy."],
+                verification=[
+                    "/usr/bin/python3 -c 'import os; p=os.path.join(os.environ[\"GROK_HOME\"], \"auth.json\"); print(\"present\" if os.path.isfile(p) else \"missing\")'"
+                ],
+            )
+            config = load_config(root / "ns")
+            config.ensure_dirs()
+            auth_bootstrap(config.auth_store(), source_home=operator)
+            before = (config.auth_store() / "auth.json").read_bytes()
+            self.assertEqual(before, b"synthetic-auth-material")
+            db = Database(config.db_path)
+            locks = LockManager(db)
+            try:
+                run = enqueue(db, job_dir, provider="fake")
+                finished = execute_run(config, db, locks, run.run_id)
+            finally:
+                db.close()
+            log = (config.runs_dir / finished.run_id / "verification.log").read_text(encoding="utf-8")
+            self.assertEqual(finished.state, RunState.SUCCEEDED.value, finished.failure_reason)
+            self.assertRegex(log, r"(?m)^missing$")
+            self.assertNotRegex(log, r"(?m)^present$")
+            self.assertFalse((config.runs_dir / finished.run_id / "grok-home" / "auth.json").exists())
+            self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
+
     def test_read_only_run_restores_neutralized_clone_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

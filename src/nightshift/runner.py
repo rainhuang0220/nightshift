@@ -238,6 +238,10 @@ def execute_run(
         # Put those entries back before verification and the report, so a
         # read-only job does not keep clone deletions.
         restore_neutralized_extensions(dest, run_dir)
+        # Verification executes repository code and can read the run directory.
+        # Drop the auth copy before that child starts. The finally block scrubs
+        # again on cancel, interrupt, and failure.
+        scrub_per_run_auth(run_dir)
         current = db.require_run(run_id)
         if current.state == RunState.CANCELLED.value:
             _finish_times(db, run_id, exit_code=exit_code_for_state(RunState.CANCELLED.value))
