@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -656,6 +657,216 @@ def _one_winner(directory: Path) -> bool:
         return len(owned) == 2 and all(row["run_id"] == loser for row in owned)
     finally:
         check.close()
+
+
+_LIVE_SNAPSHOT = (
+    '{"schema_version":1,"id":"live-auth","description":"live","type":"note",'
+    '"repository":"/tmp/unused","base_ref":"HEAD","provider":"fake","model":null,'
+    '"max_runtime_seconds":30,"max_attempts":1,"concurrency_group":"live-auth",'
+    '"network":false,"write_scope":"none","expected_artifacts":[],"verification":[],'
+    '"success_criteria":["kept"],"allow_bash":[],"prompt":"noop\\n","job_dir":"/tmp",'
+    '"job_file":"/tmp/job.toml"}'
+)
+
+
+class LiveRecoveryAuthTests(unittest.TestCase):
+    def test_live_preparing_keeps_attempt_auth(self) -> None:
+        self._live(
+            state=RunState.PREPARING.value,
+            phase="preparing",
+            classification="process_still_alive",
+            use_self=True,
+        )
+
+    def test_live_inspect_keeps_attempt_auth(self) -> None:
+        self._live(
+            state=RunState.PREPARING.value,
+            phase="inspect",
+            classification="process_still_alive",
+            use_self=False,
+        )
+
+    def test_live_provider_keeps_attempt_auth(self) -> None:
+        self._live(
+            state=RunState.RUNNING.value,
+            phase="provider",
+            classification="process_still_alive",
+            use_self=False,
+        )
+
+    def test_live_verifying_does_not_mutate_runtime(self) -> None:
+        self._live(
+            state=RunState.VERIFYING.value,
+            phase="verifying",
+            classification="verification_still_alive",
+            use_self=False,
+        )
+
+    def test_dead_preparing_removes_attempt_auth(self) -> None:
+        self._dead(state=RunState.PREPARING.value, phase="preparing", expect=RunState.INTERRUPTED.value)
+
+    def test_dead_provider_removes_attempt_auth(self) -> None:
+        self._dead(state=RunState.RUNNING.value, phase="provider", expect=RunState.INTERRUPTED.value)
+
+    def test_live_child_then_dead_recovery_removes_stale_auth(self) -> None:
+        token = "nightshift-canary-token"
+        child = _phase_child(token)
+        try:
+            with __import__("tempfile").TemporaryDirectory() as raw:
+                config, db, locks, run, auth, payload, note, store = self._case(
+                    Path(raw),
+                    state=RunState.RUNNING.value,
+                    phase="provider",
+                    pid=child.pid,
+                    token=token,
+                    identity=process_start_token(child.pid),
+                    workspace=True,
+                )
+                try:
+                    updated, decision = recover_run(config, db, locks, run.run_id)
+                    self.assertEqual(decision.classification, "process_still_alive")
+                    self.assertEqual(decision.action, "leave")
+                    self.assertEqual(updated.state, RunState.RUNNING.value)
+                    self.assertEqual(auth.read_bytes(), payload)
+                    self.assertEqual(note.read_text(encoding="utf-8"), "keep\n")
+                    self.assertEqual(db.lock_rows()[0]["run_id"], run.run_id)
+                    self.assertEqual(store.read_bytes(), b"synthetic-persistent-store\n")
+                    child.kill()
+                    child.wait(timeout=5)
+                    updated, decision = recover_run(config, db, locks, run.run_id)
+                    self.assertEqual(updated.state, RunState.INTERRUPTED.value)
+                    self.assertEqual(decision.action, "mark")
+                    self.assertFalse(decision.launch_provider)
+                    self.assertFalse(auth.exists())
+                    self.assertEqual(db.lock_rows(), [])
+                    self.assertEqual(store.read_bytes(), b"synthetic-persistent-store\n")
+                finally:
+                    db.close()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+    def _live(self, *, state: str, phase: str, classification: str, use_self: bool) -> None:
+        token = "nightshift-live-token"
+        child = None if use_self else _phase_child(token)
+        try:
+            pid = os.getpid() if child is None else child.pid
+            with __import__("tempfile").TemporaryDirectory() as raw:
+                config, db, locks, run, auth, payload, note, store = self._case(
+                    Path(raw),
+                    state=state,
+                    phase=phase,
+                    pid=pid,
+                    token=token,
+                    identity=process_start_token(pid),
+                    workspace=True,
+                )
+                # run_token needs the inserted run id for preparing. Rebuild when required.
+                if phase == "preparing":
+                    meta = dict(run.process_meta)
+                    meta["match"] = run.run_id
+                    run = db.update_run(run.run_id, process_meta=meta)
+                before_meta = dict(run.process_meta)
+                try:
+                    updated, decision = recover_run(config, db, locks, run.run_id)
+                    self.assertEqual(decision.classification, classification)
+                    self.assertEqual(decision.action, "leave")
+                    self.assertFalse(decision.launch_provider)
+                    self.assertEqual(updated.state, state)
+                    self.assertEqual(updated.verification_ran, False)
+                    self.assertEqual(updated.process_meta, before_meta)
+                    self.assertEqual(auth.read_bytes(), payload)
+                    self.assertEqual(note.read_text(encoding="utf-8"), "keep\n")
+                    self.assertEqual(db.lock_rows()[0]["run_id"], run.run_id)
+                    self.assertEqual(store.read_bytes(), b"synthetic-persistent-store\n")
+                finally:
+                    db.close()
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+    def _dead(self, *, state: str, phase: str, expect: str) -> None:
+        dead = subprocess.Popen(["true"])
+        dead.wait(timeout=5)
+        with __import__("tempfile").TemporaryDirectory() as raw:
+            config, db, locks, run, auth, _payload, _note, store = self._case(
+                Path(raw),
+                state=state,
+                phase=phase,
+                pid=dead.pid,
+                token="gone-token",
+                identity="gone",
+                workspace=True,
+            )
+            try:
+                updated, decision = recover_run(config, db, locks, run.run_id)
+                self.assertEqual(updated.state, expect)
+                self.assertFalse(decision.launch_provider)
+                self.assertFalse(auth.exists())
+                self.assertEqual(db.lock_rows(), [])
+                self.assertEqual(store.read_bytes(), b"synthetic-persistent-store\n")
+            finally:
+                db.close()
+
+    def _case(
+        self,
+        root: Path,
+        *,
+        state: str,
+        phase: str,
+        pid: int,
+        token: str,
+        identity: str,
+        workspace: bool,
+    ):
+        config = load_config(root / "ns")
+        config.ensure_dirs()
+        store = config.auth_store()
+        store.mkdir(parents=True, exist_ok=True)
+        store_file = store / "auth.json"
+        store_file.write_bytes(b"synthetic-persistent-store\n")
+        db = Database(config.db_path)
+        locks = LockManager(db)
+        run = db.insert_run(
+            empty_run(
+                job_id="live-auth",
+                provider="fake",
+                state=state,
+                attempt=1,
+                max_attempts=1,
+                job_snapshot=_LIVE_SNAPSHOT,
+                verification_ran=False,
+            )
+        )
+        run_dir = config.runs_dir / run.run_id
+        auth = run_dir / "attempt-1" / "grok-home" / "auth.json"
+        auth.parent.mkdir(parents=True)
+        payload = b"synthetic-attempt-auth\n"
+        auth.write_bytes(payload)
+        note = auth.parent / "runtime-note"
+        note.write_text("keep\n", encoding="utf-8")
+        workspace_path = root / "workspace"
+        if workspace:
+            workspace_path.mkdir()
+        meta = {"phase": phase, "pid": pid, "pgid": pid, "match": token, "identity": identity}
+        run = db.update_run(
+            run.run_id,
+            run_dir=str(run_dir),
+            pid=pid,
+            workspace_path=str(workspace_path),
+            process_meta=meta,
+        )
+        self.assertTrue(locks.acquire([group_key(phase)], run.run_id, pid=pid))
+        return config, db, locks, run, auth, payload, note, store_file
+
+
+def _phase_child(token: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", token],
+        start_new_session=True,
+    )
 
 
 def _pid_alive(pid: int) -> bool:

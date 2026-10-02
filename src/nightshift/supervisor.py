@@ -147,13 +147,21 @@ def probe_run(run: RunRecord) -> ProcessProbe:
 
 def recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:
     run = db.require_run(run_id)
-    _scrub_recovered_auth(config, run)
-    decision = classify_recovery(run, probe_run(run))
+    probe = probe_run(run)
+    decision = classify_recovery(run, probe)
     if decision.launch_provider:
         raise NightshiftError("recover refused to launch a provider")
-    if decision.action == "leave":
+    # A live phase is left alone. Auth cleanup before this check deletes the
+    # credential copy the worker is still using.
+    if decision.action == "leave" and probe.alive:
         db.update_run(run_id, recovery_class=decision.classification)
         return db.require_run(run_id), decision
+    if decision.action == "leave":
+        if decision.classification == "already_terminal":
+            _scrub_recovered_auth(config, run)
+        db.update_run(run_id, recovery_class=decision.classification)
+        return db.require_run(run_id), decision
+    _scrub_recovered_auth(config, run)
     if decision.action == "mark" and decision.new_state:
         current = db.require_run(run_id)
         if current.state not in TERMINAL_VALUES:
