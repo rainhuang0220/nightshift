@@ -61,7 +61,7 @@ nightshift auth grok bootstrap
 
 `bootstrap` copies one file, `auth.json`, from the operator's Grok profile into `state/credentials/grok/auth.json`. The parent directory is mode 0700. The file is mode 0600. The copy is a separate file, not a symlink. The command's stdout is the word `bootstrapped`. Contents are never printed. If that store is empty and a legacy `state/grok-profile/auth.json` is a regular file, Nightshift copies it once and leaves the legacy file in place.
 
-Each Grok launch copies that auth file into the per-run `GROK_HOME`. After the provider exits, Nightshift removes that copy before verification runs. Cancel, interrupt, and recovery remove it as well. Verification recovery does not copy the file again. Diagnostic files in that home stay. The persistent store is never deleted automatically and is not a provider writable root.
+Each Grok launch copies that auth file into the per-run `GROK_HOME`. After the provider exits, Nightshift removes that copy before verification runs. Cancel, interrupt, and recovery remove it as well. Verification recovery does not copy the file again. If `grok-home` itself is a symlink, Nightshift unlinks that symlink and does not follow it into the credential store. Copying `auth.json` refuses a symlinked parent and opens the destination without following a final symlink. Diagnostic files in a real per-run home stay. The persistent store is never deleted automatically and is not a provider writable root.
 
 No other auth file is copied unless a real launch shows that the CLI requires it. Unit tests use a synthetic auth file. The real file is gitignored with the rest of `state/`.
 

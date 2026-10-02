@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from nightshift.config import load_config
 from nightshift.containment import (
@@ -19,7 +20,7 @@ from nightshift.containment import (
 from nightshift.db import Database
 from nightshift.job import JobValidationError, load_job
 from nightshift.locks import LockManager
-from nightshift.models import RunState
+from nightshift.models import NightshiftError, RunState
 from nightshift.policy import build_policy, render_preamble
 from nightshift.queue import enqueue
 from nightshift.runner import execute_run
@@ -38,6 +39,11 @@ import nightshift
 
 def _env(home: Path) -> dict[str, str]:
     return {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(home)}
+
+
+def _auth_snapshot(path: Path) -> tuple[bytes, int, int]:
+    info = os.lstat(path)
+    return (path.read_bytes(), stat.S_IMODE(info.st_mode), info.st_ino)
 
 
 def _saw(profile: Path, cwd: Path, env: dict[str, str], target: Path, needle: str) -> bool:
@@ -471,6 +477,126 @@ class RuntimeProfileTests(unittest.TestCase):
             self.assertNotRegex(log, r"(?m)^present$")
             self.assertFalse((config.runs_dir / finished.run_id / "grok-home" / "auth.json").exists())
             self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
+
+    def test_contained_grok_home_symlink_does_not_change_the_auth_store(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = root / "credentials" / "grok"
+            store.mkdir(parents=True)
+            os.chmod(store, 0o700)
+            auth = store / "auth.json"
+            copy_auth_file(self._source(root), auth)
+            (store / "marker.txt").write_text("store-marker\n", encoding="utf-8")
+            before = _auth_snapshot(auth)
+            dir_mode = stat.S_IMODE(os.lstat(store).st_mode)
+            run_dir = root / "run"
+            home = prepare_run_grok_home(run_dir, store)
+            self.assertFalse(home.is_symlink())
+            profile = write_profile(
+                root / "provider.sb",
+                writable=[run_dir],
+                network=False,
+                read_policy=build_read_policy(runtime_roots=[run_dir], source_root=root / "source"),
+            )
+            script = (
+                "import os, shutil, sys\n"
+                "home, store = sys.argv[1], sys.argv[2]\n"
+                "target = os.path.join(store, 'auth.json')\n"
+                "try:\n"
+                "    open(target, 'w').write('stolen')\n"
+                "    print('STORE_WRITE_OK')\n"
+                "except OSError:\n"
+                "    print('STORE_WRITE_BLOCKED')\n"
+                "if os.path.lexists(home):\n"
+                "    if os.path.islink(home) or os.path.isfile(home):\n"
+                "        os.unlink(home)\n"
+                "    else:\n"
+                "        shutil.rmtree(home)\n"
+                "os.symlink(store, home)\n"
+                "print('LINKED' if os.path.islink(home) else 'NOT_LINKED')\n"
+            )
+
+            def replace() -> None:
+                code, output = contained_run(
+                    ["/usr/bin/python3", "-c", script, str(home), str(store)],
+                    cwd=run_dir,
+                    env=_env(run_dir),
+                    profile=profile,
+                    timeout=30,
+                )
+                self.assertEqual(code, 0, output)
+                self.assertIn("STORE_WRITE_BLOCKED", output)
+                self.assertNotIn("STORE_WRITE_OK", output)
+                self.assertIn("LINKED", output)
+                self.assertTrue(home.is_symlink())
+
+            def assert_store_unchanged() -> None:
+                self.assertEqual(_auth_snapshot(auth), before)
+                self.assertEqual(stat.S_IMODE(os.lstat(store).st_mode), dir_mode)
+                self.assertEqual((store / "marker.txt").read_text(encoding="utf-8"), "store-marker\n")
+
+            replace()
+            self.assertTrue(scrub_per_run_auth(run_dir))
+            assert_store_unchanged()
+            self.assertFalse(home.exists())
+
+            replace()
+            prepared = prepare_run_grok_home(run_dir, store, copy_auth=False)
+            assert_store_unchanged()
+            self.assertFalse(prepared.is_symlink())
+            self.assertFalse((prepared / "auth.json").exists())
+
+            replace()
+            other = root / "other-auth.json"
+            other.write_bytes(b"different-auth-material")
+            with self.assertRaises(NightshiftError):
+                copy_auth_file(other, home / "auth.json")
+            assert_store_unchanged()
+            self.assertTrue(home.is_symlink())
+
+            replaced = prepare_run_grok_home(run_dir, store, copy_auth=True)
+            assert_store_unchanged()
+            self.assertFalse(replaced.is_symlink())
+            self.assertNotEqual(os.lstat(replaced / "auth.json").st_ino, before[2])
+
+            link = replaced / "auth.json"
+            link.unlink()
+            link.symlink_to(auth)
+            self.assertTrue(scrub_per_run_auth(run_dir))
+            assert_store_unchanged()
+            self.assertFalse(link.exists())
+
+    def test_scrub_failure_still_releases_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            make_repo(source)
+            job_dir = root / "job"
+            write_job(
+                job_dir,
+                source,
+                provider="fake",
+                write_scope="none",
+                network=False,
+                expected_artifacts=[],
+                verification=[],
+                success_criteria=["Locks are released."],
+            )
+            config = load_config(root / "ns")
+            config.ensure_dirs()
+            db = Database(config.db_path)
+            locks = LockManager(db)
+            try:
+                run = enqueue(db, job_dir, provider="fake")
+                with patch("nightshift.runner.scrub_per_run_auth", side_effect=OSError("scrub failed")) as scrub:
+                    finished = execute_run(config, db, locks, run.run_id)
+                self.assertGreaterEqual(scrub.call_count, 1)
+                self.assertEqual(
+                    [row["run_id"] for row in db.lock_rows() if row["run_id"] == finished.run_id],
+                    [],
+                )
+            finally:
+                db.close()
 
     def test_read_only_run_restores_neutralized_clone_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

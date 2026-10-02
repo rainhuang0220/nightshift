@@ -9,6 +9,7 @@ are never printed.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -66,30 +67,40 @@ def prepare_run_grok_home(run_dir: Path, auth_store: Path, *, copy_auth: bool = 
     Provider launches copy the minimum auth file. Verification does not.
     A verification child can read the run directory, so leaving the copy
     there would publish the credential to that command.
+
+    A symlink at `grok-home` is removed and not followed. The persistent
+    store is never the directory this function writes.
     """
-    home = ensure_private_dir(per_run_grok_home(run_dir))
-    destination = home / AUTH_FILENAME
+    home = per_run_grok_home(run_dir)
+    _drop_directory_symlink(home)
+    _ensure_real_private_dir(home)
     if not copy_auth:
-        if destination.is_symlink() or destination.exists():
-            destination.unlink()
+        _unlink_directory_entry(home, AUTH_FILENAME)
         return home
     source = auth_store / AUTH_FILENAME
-    if source.is_file() and not source.is_symlink():
-        copy_auth_file(source, destination)
+    info = _lstat(source)
+    if info is not None and stat.S_ISREG(info.st_mode):
+        copy_auth_file(source, home / AUTH_FILENAME)
     return home
 
 
 def scrub_per_run_auth(run_dir: Path) -> bool:
     """Remove the per-run auth copy. Keep other files and the persistent store.
 
-    A symlink is unlinked without following it, so this cannot delete the
-    persistent auth file by accident.
+    When `grok-home` itself is a symlink, only that link is removed. The
+    function does not follow it, and it does not raise: callers in `finally`
+    still have to release locks.
     """
-    path = per_run_grok_home(run_dir) / AUTH_FILENAME
-    if not path.is_symlink() and not path.exists():
-        return False
-    path.unlink()
-    return True
+    home = per_run_grok_home(run_dir)
+    try:
+        if _drop_directory_symlink(home):
+            return True
+        return _unlink_directory_entry(home, AUTH_FILENAME)
+    except OSError:
+        try:
+            return _drop_directory_symlink(home)
+        except OSError:
+            return False
 
 
 def stage_pythonpath(run_dir: Path) -> Path:
@@ -156,21 +167,103 @@ def auth_bootstrap(profile: Path, source_home: Path | None = None) -> str:
 
 
 def copy_auth_file(source: Path, destination: Path) -> None:
-    """Write one auth file at mode 0600. The destination is not a symlink."""
-    if source.is_symlink():
+    """Write one auth file at mode 0600. The destination is not a symlink.
+
+    The parent directory is opened with `O_NOFOLLOW`. A symlink parent is
+    refused, and a symlink final component is unlinked before a new file
+    is created. Neither step follows the link into another directory.
+    """
+    source_info = _lstat(source)
+    if source_info is None or not stat.S_ISREG(source_info.st_mode):
         raise NightshiftError("refusing to copy an auth symlink")
     data = source.read_bytes()
-    ensure_private_dir(destination.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(destination, flags, 0o600)
+    parent = destination.parent
+    parent_info = _lstat(parent)
+    if parent_info is None:
+        parent.mkdir(parents=True, exist_ok=True)
+        parent_info = _lstat(parent)
+    if parent_info is None or stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise NightshiftError("refusing to copy auth through a symlinked directory")
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.write(fd, data)
+        os.fchmod(parent_fd, 0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        try:
+            fd = os.open(destination.name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno != errno.ELOOP:
+                raise
+            os.unlink(destination.name, dir_fd=parent_fd)
+            fd = os.open(
+                destination.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        try:
+            os.write(fd, data)
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
-    os.chmod(destination, 0o600)
-    if destination.is_symlink():
-        raise NightshiftError("auth destination must be a regular file")
+        os.close(parent_fd)
 
 
 def _mode(path: Path) -> str:
     return oct(stat.S_IMODE(path.stat().st_mode))
+
+
+def _lstat(path: Path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def _drop_directory_symlink(path: Path) -> bool:
+    """Remove `path` when it is a symlink. The target is left in place."""
+    info = _lstat(path)
+    if info is None or not stat.S_ISLNK(info.st_mode):
+        return False
+    os.unlink(path)
+    return True
+
+
+def _ensure_real_private_dir(path: Path) -> None:
+    """Create `path` as a real directory and set mode 0700 without following a symlink."""
+    _drop_directory_symlink(path)
+    info = _lstat(path)
+    if info is None:
+        path.mkdir(parents=True, exist_ok=True)
+        info = _lstat(path)
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        os.unlink(path)
+        path.mkdir(parents=True, exist_ok=True)
+        info = _lstat(path)
+    if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise NightshiftError("refusing to use a symlinked directory for auth")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _unlink_directory_entry(parent: Path, name: str) -> bool:
+    """Unlink one entry in a real directory. A symlink entry is not followed."""
+    info = _lstat(parent)
+    if info is None:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError(errno.ELOOP, "parent is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.unlink(name, dir_fd=fd)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(fd)

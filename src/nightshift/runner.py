@@ -326,9 +326,12 @@ def execute_run(
             pass
         return db.require_run(run_id)
     finally:
-        if dest is not None:
-            restore_neutralized_extensions(dest, run_dir)
-        scrub_per_run_auth(run_dir)
+        try:
+            if dest is not None:
+                restore_neutralized_extensions(dest, run_dir)
+            scrub_per_run_auth(run_dir)
+        except Exception:
+            pass
         locks.release(run_id)
 
 
