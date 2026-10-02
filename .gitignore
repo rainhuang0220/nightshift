@@ -2,6 +2,8 @@ state/
 state/grok-profile/
 runs/
 worktrees/
+workspaces/
+config/nightshift.toml
 .venv/
 __pycache__/
 *.py[cod]

@@ -1,59 +1,117 @@
 # Nightshift
 
-Nightshift is a local control plane for unattended overnight work. It queues a job, copies the recorded revision into an independent local clone, runs a provider inside a seatbelt and a private Grok profile, checks the original repository, and writes a morning report. A human imports any result. Nightshift does not merge and does not push.
+Nightshift is a local control plane for unattended overnight work. You write a job. Nightshift queues it, copies one recorded revision into an independent Git clone, runs a provider inside a seatbelt and a private runtime profile, checks that the original repository did not change, and writes a morning report. You import any result yourself.
 
-This repository is the control plane. It is not tied to any target project. Point a job at a repository; Nightshift does not vendor that repository.
+It exists so a long model session can work while you are away without becoming a silent channel into your real checkout, your credentials, or your normal editor extensions. The model does the reasoning. Nightshift does the bookkeeping and the checks.
 
-v0.2 runs on macOS with Python 3.11+ and the standard library. It uses `/usr/bin/sandbox-exec` for process containment. It does not need Docker, a server, or a cloud account.
+This repository is the control plane. It does not vendor a target project. Point a job at a repository when you are ready.
+
+**Status: 0.2.0, alpha.** The supported host is macOS with Python 3.11+ and `/usr/bin/sandbox-exec`. The sacrificial Grok canary is `PASS_WITH_LIMITATIONS`. Nightshift does not merge, push, or install a system service.
+
+## Architecture
+
+```text
+job snapshot
+    |
+    v
+read-only source
+    |
+    v
+independent local clone
+    |
+    v
+private HOME and GROK_HOME
+    |
+    +--------+--------+
+    |                 |
+permission rules   seatbelt
+    |                 |
+    +--------+--------+
+             |
+             v
+      verification
+             |
+             v
+   source-integrity gate
+             |
+             v
+      morning report
+             |
+             v
+      human import
+```
+
+The default workspace is an independent clone (`git clone --no-hardlinks`, detached checkout of the recorded revision, `origin` removed). `isolation = "worktree"` still exists. It shares the source Git directory, is labeled weaker isolation, and is not the default.
+
+Design notes: `docs/architecture.md`, `docs/threat-model.md`, `docs/grok-runtime-isolation.md`.
 
 ## Install
-
-From this repository:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/nightshift doctor
-.venv/bin/nightshift auth grok bootstrap
 ```
 
-Without installing, the same entry point is:
+From a checkout, without installing:
 
 ```bash
 PYTHONPATH=src python3 -m nightshift doctor
 ```
 
-`auth grok bootstrap` copies only the Grok auth file into `state/grok-profile/`. That directory is gitignored. The command prints whether the copy succeeded. It does not print the file.
+Copy `config/nightshift.example.toml` to `config/nightshift.toml` only when you want to override paths or concurrency. The example file is not loaded automatically. `config/nightshift.toml` is gitignored.
 
-Copy `config/nightshift.example.toml` to `config/nightshift.toml` only when you want to override the defaults. The example file is not loaded automatically.
+## Doctor
 
-## Commands
-
-```text
+```bash
 nightshift doctor
-nightshift auth grok status
-nightshift auth grok bootstrap
-nightshift job validate <path>
-nightshift queue add <path>
-nightshift queue list
-nightshift run <path>
-nightshift daemon
-nightshift status
-nightshift logs <run-id>
-nightshift report [run-id]
-nightshift recover
-nightshift cancel <run-id>
+```
+
+Doctor checks Python, a writable state directory, SQLite, Git, and whether the Grok CLI is on `PATH`. It does not launch a model.
+
+## Fake safety probe
+
+```bash
 nightshift safety probe
+```
+
+The default probe is deterministic. It builds a temporary repository and does not call Grok. Exit 0 means `PASS`. Exit 1 means `FAIL`.
+
+## Grok auth bootstrap
+
+Unattended Grok uses a Nightshift profile at `state/grok-profile/`, not your normal Grok home.
+
+```bash
+nightshift auth grok bootstrap
+nightshift auth grok status
+```
+
+Bootstrap copies only the Grok auth file into that profile. The directory is mode 0700 and the file is mode 0600. The command does not print the file. The profile is gitignored.
+
+## Real safety probe
+
+```bash
 nightshift safety probe --provider grok
 ```
 
-`run` and `queue add` accept `--provider fake` or `--provider grok`. `--root` puts `state/`, `runs/`, and `worktrees/` somewhere other than the current directory. Exit codes: 0 success, 1 failed or cancelled, 2 invalid usage or job, 3 unknown run, 4 blocked, 5 interrupted.
+This runs one sacrificial Grok session in a temporary repository, with an outside sentinel and a local bare remote. It does not use your project and it does not push to GitHub. Run it only when you mean to. The recorded v0.2 result is `PASS_WITH_LIMITATIONS`.
 
-`safety probe` exits 0 for `PASS` and `PASS_WITH_LIMITATIONS`, and 1 for `FAIL`. The default probe is deterministic and does not call Grok. `--provider grok` is the sacrificial canary.
+## Jobs
 
-`recover` reconciles active rows with real processes. It does not relaunch a provider. `recover --retry` requeues a `FAILED` or `INTERRUPTED` run only when attempts remain.
+A job is a directory with `job.toml` and `prompt.md`. See `docs/job-format.md` and `jobs/examples/repo_audit/`.
 
-## Overnight daemon
+```bash
+nightshift job validate jobs/examples/repo_audit
+nightshift run path/to/job --provider fake
+nightshift queue add path/to/job
+nightshift queue list
+```
+
+The example job uses `provider = "fake"` and the placeholder repository `REPLACE_WITH_REPOSITORY_PATH`. Validation accepts it. Queueing it unchanged blocks, because that placeholder is not a Git checkout. Replace `repository` before you queue a real job.
+
+`run` and `queue add` accept `--provider fake` or `--provider grok`. `--root` relocates `state/`, `runs/`, and `worktrees/`.
+
+## Daemon
 
 Keep the machine awake and run one job at a time:
 
@@ -61,13 +119,36 @@ Keep the machine awake and run one job at a time:
 caffeinate -i nightshift daemon
 ```
 
-Stop it with Ctrl-C or SIGTERM. Queued jobs stay queued. Nightshift does not install a launchd job or any other persistent system service. You start it when you want it.
+Stop it with Ctrl-C or SIGTERM. Queued jobs stay queued. Nightshift does not install a launchd job. You start the daemon when you want it.
 
-## Jobs
+Other commands: `status`, `logs`, `report`, `recover`, `cancel`. `recover` reconciles active rows with real processes and does not relaunch a provider. `recover --retry` requeues a failed or interrupted run only when attempts remain.
 
-A job is a directory with `job.toml` and `prompt.md`. See `docs/job-format.md` and `jobs/examples/repo_audit/`. The example uses `provider = "fake"` and a placeholder repository path so validation cannot silently target a real checkout. Replace `repository` before you queue it.
+Exit codes: 0 success, 1 failed or cancelled, 2 invalid usage or job, 3 unknown run, 4 blocked, 5 interrupted. The safety probe uses 0 for `PASS` and `PASS_WITH_LIMITATIONS`, and 1 for `FAIL`.
 
-The default `isolation` is `clone`. `isolation = "worktree"` is optional, shares the source git directory, and is not the unattended default.
+## Safety model
+
+Nightshift relies on these layers, in this order:
+
+- model instructions, which are advisory
+- Grok permission rules, which filter Grok tool calls
+- a PATH shim, which is defense in depth for PATH lookup
+- a seatbelt profile, which is the filesystem and process containment Nightshift controls
+- an isolated `HOME` and `GROK_HOME`, which keep your normal Grok extensions and credentials out of the child
+- an independent clone, which keeps source refs and Git metadata separate
+- a source-integrity snapshot, which detects concurrent source changes and refuses `SUCCEEDED`
+- human review, which is the only import path
+
+`grok inspect --json` must pass before a real Grok launch. User hooks, plugins, external MCP servers, and imported Claude, Cursor, or Codex extensions block the launch. Project instruction files can still influence reasoning. They do not, by themselves, grant tools.
+
+## Limitations
+
+The provider needs network connectivity to reach the model API. Arbitrary external network mutation, including an https or ssh `git push`, is not currently an operating-system hard block. Verification runs with network denied. A push to a local path outside the writable roots is a filesystem hard block.
+
+Grok's own `--sandbox` flag is not passed. Nested sandbox setup fails inside the seatbelt, and Grok then refuses to start.
+
+Redaction of logs is best-effort. It is not a guarantee over arbitrary repository content.
+
+The morning report is a summary plus the integrity result. It is not a complete audit of every side effect. Human review is required on every report, including `SUCCEEDED`.
 
 ## Tests
 
@@ -75,27 +156,14 @@ The default `isolation` is `clone`. `isolation = "worktree"` is optional, shares
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Discover the tests by directory. A third-party package named `tests` may exist on the interpreter path; importing `tests.*` as a module name loads that package instead of this suite.
+Discover the tests by directory. Tests use temporary Git repositories and do not call Grok.
 
-Tests use `FakeProvider` and temporary git repositories. They do not call Grok.
+## Project
 
-## Safety
+- Changelog: `CHANGELOG.md`
+- License: Apache-2.0, `LICENSE`. Copyright 2026 rainhuang0220.
+- Contributing: `CONTRIBUTING.md`
+- Security reports: `SECURITY.md`
+- Version: `src/nightshift/__init__.py` (`__version__`)
 
-Read `docs/threat-model.md` and `docs/grok-runtime-isolation.md` before a real Grok job. The layers, in the order Nightshift relies on them, are:
-
-- model instructions, which are advisory
-- Grok permission rules, which filter Grok tool calls
-- a PATH shim, which is defense in depth for PATH lookup
-- a seatbelt profile, which is the filesystem and process containment Nightshift controls
-- an isolated `HOME` and `GROK_HOME`, which keep the operator's Grok extensions and credentials out of the child
-- an independent clone, which keeps source refs and git metadata separate
-- a source-integrity snapshot, which detects concurrent source changes and refuses `SUCCEEDED`
-- human review, which is the only import path
-
-`safety probe` exercises the clone, the seatbelt, the integrity gate, and the extension audit on a temporary repository. `safety probe --provider grok` adds one sacrificial Grok session. The provider seatbelt allows network so the model API can be reached, so a successful real probe is `PASS_WITH_LIMITATIONS`.
-
-## Layout
-
-Runtime directories `state/`, `state/grok-profile/`, `runs/`, and `worktrees/` are gitignored. Authoritative state is SQLite at `state/nightshift.db`, mode 0600. Each run writes logs under `runs/<run-id>/`, mode 0700 for the directory and 0600 for the logs.
-
-Design notes live in `docs/architecture.md`. The v0.1 audit lives in `docs/security-audit-v0.1.md`. Contributor rules live in `AGENTS.md`.
+Repository: <https://github.com/rainhuang0220/nightshift>

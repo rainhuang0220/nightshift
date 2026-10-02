@@ -1,10 +1,31 @@
 [project]
 name = "nightshift"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Local control plane for unattended overnight work in isolated git clones."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "rainhuang0220", email = "iamrainhuang@163.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/rainhuang0220/nightshift"
+Repository = "https://github.com/rainhuang0220/nightshift"
+Changelog = "https://github.com/rainhuang0220/nightshift/blob/main/CHANGELOG.md"
+Issues = "https://github.com/rainhuang0220/nightshift/issues"
 
 [project.scripts]
 nightshift = "nightshift.cli:main"
@@ -12,6 +33,9 @@ nightshift = "nightshift.cli:main"
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "nightshift.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -157,7 +157,7 @@ class PolicyTests(unittest.TestCase):
         env = minimal_env(
             {
                 "PATH": "/usr/bin",
-                "HOME": "/Users/someone",
+                "HOME": "/home/operator",
                 "AWS_SECRET_ACCESS_KEY": "hidden",
                 "GITHUB_TOKEN": "hidden",
                 "LANG": "C",
