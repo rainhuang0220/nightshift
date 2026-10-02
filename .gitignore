@@ -1,5 +1,6 @@
 state/
 state/grok-profile/
+state/credentials/
 runs/
 worktrees/
 workspaces/

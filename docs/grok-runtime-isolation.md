@@ -12,7 +12,7 @@ That stops automatic discovery of user-level directories that live under the nor
 
 ## Dedicated GROK_HOME
 
-`GROK_HOME` is `state/grok-profile/`, mode 0700. The profile contains only what Nightshift intentionally places there.
+`GROK_HOME` is `runs/<run-id>/grok-home/`, mode 0700, created for that run. The next run gets a new directory. The profile contains only what Nightshift copies in and what the CLI materializes during that run.
 
 Nightshift does not copy:
 
@@ -59,7 +59,9 @@ nightshift auth grok bootstrap
 
 `status` prints `auth present` or `auth absent`, and the file mode when the file exists. It does not print a path and it does not print file contents.
 
-`bootstrap` copies one file, `auth.json`, from the operator's Grok profile into `state/grok-profile/auth.json`. The profile directory is mode 0700. The file is mode 0600. The copy is a separate file, not a symlink. The command's stdout is the word `bootstrapped`. Contents are never printed.
+`bootstrap` copies one file, `auth.json`, from the operator's Grok profile into `state/credentials/grok/auth.json`. The parent directory is mode 0700. The file is mode 0600. The copy is a separate file, not a symlink. The command's stdout is the word `bootstrapped`. Contents are never printed. If that store is empty and a legacy `state/grok-profile/auth.json` is a regular file, Nightshift copies it once and leaves the legacy file in place.
+
+Each Grok launch copies that auth file into the per-run `GROK_HOME`. After the provider exits, and on cancel, interrupt, and recovery, Nightshift removes the per-run copy. Diagnostic files in that home stay. The persistent store is never deleted automatically and is not a provider writable root.
 
 No other auth file is copied unless a real launch shows that the CLI requires it. Unit tests use a synthetic auth file. The real file is gitignored with the rest of `state/`.
 
@@ -102,16 +104,18 @@ A check on Grok 1.0.46 showed two different results. Outside the seatbelt, `--sa
 
 The seatbelt is the containment Nightshift enforces:
 
-- deny by default
-- writes only under the resolved workspace, the run directory, and, for the provider, the Nightshift Grok profile
-- reads of operator credential and extension paths denied
+- deny by default, with no global file-read allow
+- system and toolchain reads, then a deny of the operator home and the original source checkout
+- a re-allow of the workspace, the run directory, the private `HOME`, the per-run `GROK_HOME`, the resolved tool path, and config `read_roots` only
+- `file-read-metadata` on ancestors of those roots, so a path walk can stat them without reading their contents
+- writes only under the workspace and the run directory
 - `/dev/null` readable and writable
 - verification denies network
 - the Grok provider allows network
 
 If `sandbox-exec` itself is missing, Nightshift blocks the run. It does not fall through to Grok's own sandbox flag.
 
-The last matching seatbelt rule wins, so credential read denials are written after the general read allow. Writable paths are resolved so a `/var` path and its `/private/var` alias name the same directory.
+The last matching seatbelt rule wins, so the re-allow is written after the home and source denies. A path is emitted both as named and resolved, so a `/var` path and its `/private/var` alias match. A job prompt cannot add a read root.
 
 ## Accepted network limitation
 
@@ -134,7 +138,7 @@ Counts, not paths:
 - MCP servers 0
 - operator-global instructions 0
 - builtin agents only
-- skills: the CLI's bundled set, paths under `state/grok-profile`, and no user, project, or plugin skills
+- skills: the CLI's bundled set, paths under that run's `grok-home`, and no user, project, or plugin skills
 - permission sources empty and permissions loaded 0
 
 The operator's normal inspect is a different process, with the operator's home and the operator's `GROK_HOME`. Those counts must not appear in the Nightshift child. The safety probe checks that, and a mismatch blocks the launch.

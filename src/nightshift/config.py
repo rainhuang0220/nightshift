@@ -30,15 +30,20 @@ class Config:
     max_turns: int = 40
     permission_mode: str = "dontAsk"
     destroy_failed_worktrees: bool = False
+    explicit_read_roots: tuple[Path, ...] = ()
 
     def ensure_dirs(self) -> None:
         ensure_private_dir(self.state_dir)
         ensure_private_dir(self.runs_dir)
         ensure_private_dir(self.worktrees_dir)
-        ensure_private_dir(self.state_dir / "grok-profile")
+        from nightshift.runtime import ensure_auth_store
 
-    def grok_profile(self) -> Path:
-        return self.state_dir / "grok-profile"
+        ensure_auth_store(self.state_dir)
+
+    def auth_store(self) -> Path:
+        from nightshift.runtime import auth_store_dir
+
+        return auth_store_dir(self.state_dir)
 
 
 def load_config(root: Path | None = None, config_path: Path | None = None) -> Config:
@@ -55,6 +60,7 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
     supervisor = data.get("supervisor") or {}
     provider = data.get("provider") or {}
     policy = data.get("policy") or {}
+    containment = data.get("containment") or {}
     state_dir = _under_root(chosen_root, paths.get("state_dir") or "state")
     runs_dir = _under_root(chosen_root, paths.get("runs_dir") or "runs")
     worktrees_dir = _under_root(chosen_root, paths.get("worktrees_dir") or "worktrees")
@@ -67,8 +73,9 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
     permission_mode = str(provider.get("permission_mode", "dontAsk"))
     if permission_mode in {"bypassPermissions", "always-approve", "always_approve"}:
         raise UsageError(
-            "refusing permission_mode that bypasses approvals; v0.1 uses dontAsk plus deny rules"
+            "refusing permission_mode that bypasses approvals; Nightshift uses dontAsk plus deny rules"
         )
+    read_roots = _read_roots(chosen_root, containment.get("read_roots") or [])
     return Config(
         root=chosen_root,
         state_dir=state_dir,
@@ -81,6 +88,7 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
         max_turns=int(provider.get("max_turns", 40)),
         permission_mode=permission_mode,
         destroy_failed_worktrees=bool(policy.get("destroy_failed_worktrees", False)),
+        explicit_read_roots=read_roots,
     )
 
 
@@ -100,6 +108,15 @@ def _discover_config(root: Path, explicit: Path | None) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def _read_roots(root: Path, value) -> tuple[Path, ...]:
+    """Operator-configured toolchain roots. A job prompt cannot add these."""
+    if value in (None, "", []):
+        return ()
+    if not isinstance(value, list) or any(isinstance(item, bool) or not isinstance(item, str) for item in value):
+        raise UsageError("containment.read_roots must be a list of path strings")
+    return tuple(_under_root(root, item) for item in value)
 
 
 def _under_root(root: Path, value: str) -> Path:

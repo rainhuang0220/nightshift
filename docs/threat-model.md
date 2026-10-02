@@ -46,11 +46,11 @@ A wide outer profile still gets that EPERM, so this is nested `sandbox_init`, no
 
 ### 5. Seatbelt
 
-**Containment.** Provider and verification processes are started under `/usr/bin/sandbox-exec` with a deny-default profile. Writable roots are resolved paths: the workspace and the run directory, plus the Nightshift Grok profile for the provider only. `/dev/null` is readable and writable. Reads of operator credential and extension locations are denied after the general read allow, because the last matching rule wins. Those locations include `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.netrc`, `.npmrc`, `.git-credentials`, `.kaggle`, and the operator Grok auth file, MCP credentials, config, skills, hooks, plugins, memory, and sessions. The Grok binary directory is not denied, so the CLI can start.
+**Containment.** Provider and verification processes are started under `/usr/bin/sandbox-exec` with a deny-default profile. There is no global `(allow file-read*)`. The profile allows required system and toolchain reads, denies the operator home and the original source checkout, then re-allows only the isolated workspace, the run directory, the private runtime `HOME`, the per-run `GROK_HOME`, the resolved Grok or interpreter path, and roots listed in Nightshift config as `[containment] read_roots`. A job prompt cannot add roots. The operator home is refused as a read root. Writable roots are the workspace and the run directory. The persistent auth store is not writable. `/dev/null` is readable and writable. The last matching rule wins, so the re-allow is written after the home and source denies. A path is emitted both as named and symlink-resolved, so `/var` and `/private/var` match. Traversal anchors such as `/var` and `/opt` are literals. A `subpath` rule on those symlink roots would expose the whole target tree. Ancestors of a re-allowed root, including `/private/var/folders`, are `file-read-metadata` literals. That lets a process stat the path. It does not list the directory or read files there.
 
-If `sandbox-exec` is missing, the run is blocked. Nightshift does not fall through to an unsandboxed child.
+If `sandbox-exec` is missing, the run is blocked. Nightshift does not fall through to an unsandboxed child and does not fall through to Grok's `--sandbox` flag.
 
-Verification denies `network*`. The Grok provider profile allows `network*` so the model API can be reached. That is an accepted limit: an https or ssh `git push` is not an OS hard block on the provider profile. A push to a local bare repository is a filesystem write outside the writable roots and is a hard block. The honest safety-gate result while this limit stands is `PASS_WITH_LIMITATIONS`, not `PASS`.
+Verification denies `network*`. The Grok provider profile allows `network*` so the model API can be reached. Child processes inherit that network. An https or ssh `git push` is not an OS hard block on the provider profile. Blocking `curl` or `python` by name would not close it. A push to a local bare repository is a filesystem write outside the writable roots and is a hard block. The honest safety-gate result while this limit stands is `PASS_WITH_LIMITATIONS`, not `PASS`.
 
 The provider profile's network allowance is independent of `job.network`. `job.network = false` disables Grok web search. It does not close the provider's sockets.
 
@@ -62,7 +62,7 @@ An absolute binary such as `/usr/bin/git` never hits the shim. Python, `/bin/sh`
 
 ### 7. Source integrity gate
 
-**Detection.** Before `SUCCEEDED`, Nightshift compares a stored snapshot with the source. The snapshot covers HEAD, porcelain status, the current branch, every ref and its object id, `packed-refs`, the local git config, the index, the hooks tree, and the worktree registry. It does not hash the object database. Files larger than 1_000_000 bytes contribute their size rather than their bytes.
+**Detection.** Before `SUCCEEDED`, Nightshift compares a stored snapshot with the source. The snapshot covers HEAD, porcelain status, the current branch, every ref and its object id, `packed-refs`, the local git config, the index, the hooks tree, and the worktree registry. It does not hash the object database. Hooks and worktree entries record type, relative path, symlink target, and a full content digest. A protected tree file larger than 1_000_000 bytes, or an unreadable protected path, fails the snapshot closed. The index, local config, and `packed-refs` are always content-hashed. Same-size replacement of a protected hook or worktree file changes the digest.
 
 A difference is `SOURCE_INTEGRITY_VIOLATION`. The run is not `SUCCEEDED`. Nightshift does not restore the source. The baseline is the snapshot taken after workspace prepare, so a clone's lack of source mutation is the expected start, and a worktree's registry update is the only allowed prepare difference.
 
@@ -84,13 +84,13 @@ A failed audit is `BLOCKED_EXTENSION_SURFACE`. The model is not launched.
 
 ### 10. Isolated HOME and GROK_HOME
 
-**Containment of extensions and credentials.** The child `HOME` is `runs/<run-id>/runtime-home`, mode 0700. `GROK_HOME` is `state/grok-profile`, mode 0700. `TMPDIR` is a private directory under the run. The operator's `~/.agents`, `~/.claude`, `~/.cursor`, skills, plugins, hooks, MCP definitions, memory, and sessions are not copied. Details and the auth copy are in `docs/grok-runtime-isolation.md`.
+**Containment of extensions and credentials.** The child `HOME` is `runs/<run-id>/runtime-home`, mode 0700. `GROK_HOME` is `runs/<run-id>/grok-home`, created for that run and not reused. The persistent auth file is `state/credentials/grok/auth.json` (parent mode 0700, file mode 0600). Each launch copies only that file into the per-run home. Exit, cancel, interrupt, and recovery delete the copy and leave the store. `TMPDIR` is a private directory under the run. The operator's `~/.agents`, `~/.claude`, `~/.cursor`, skills, plugins, hooks, MCP definitions, memory, and sessions are not copied. Details are in `docs/grok-runtime-isolation.md`.
 
 ### 11. Environment minimization
 
-**Prevention of inherited tokens.** The child environment drops names matching `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `PASSWD`, or `SESSION`, and drops `AWS_`, `AZURE_`, `GOOGLE_`, `KAGGLE_`, `NPM_`, `PYPI_`, `GH_`, and `GITHUB_` prefixes. `SSH_AUTH_SOCK` is removed. `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, and `GIT_CONFIG_GLOBAL` points at an empty file in the run directory. Grok authentication lives in the Nightshift profile, not in a shell variable.
+**Prevention of inherited tokens.** The child environment drops names matching `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `PASSWD`, or `SESSION`, and drops `AWS_`, `AZURE_`, `GOOGLE_`, `KAGGLE_`, `NPM_`, `PYPI_`, `GH_`, and `GITHUB_` prefixes. `SSH_AUTH_SOCK` is removed. `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, and `GIT_CONFIG_GLOBAL` points at an empty file in the run directory.
 
-`minimal_env` still copies `HOME` from the parent as a placeholder. The runner then replaces `HOME` with the runtime home. The placeholder is not the boundary.
+`minimal_env` still copies `HOME` from the parent as a placeholder. The runner then replaces `HOME` with the runtime home. The placeholder is not the boundary. Grok authentication lives in the persistent auth store, not in a shell variable.
 
 ### 12. Logs
 
@@ -120,19 +120,20 @@ The supervisor starts the child in its own session and signals that process grou
 
 **Operator circuit breaker.** When set to `1`, a Grok launch is refused before `inspect` and before the model starts. Tests set it. It is not a sandbox.
 
-## What v0.2 claims
+## What the current tree claims
 
 - The default workspace is an independent clone. Source refs, the source index, the source worktree registry, and untracked dirty files stay as they were.
-- A changed protected source category withholds `SUCCEEDED` on every finalization path, including recovery.
-- The provider and verification children do not see the operator's normal Grok extension surface.
+- A changed protected source category withholds `SUCCEEDED` on every finalization path, including recovery. Protected hook and worktree metadata is content evidence, not a size.
+- The provider can read the clone, its run directory, and required system files. It cannot read the original checkout or an unrelated file in the operator home. That boundary is the seatbelt, not the prompt.
+- The provider and verification children do not see the operator's normal Grok extension surface. One run's `GROK_HOME` is not the next run's profile.
 - Absolute interpreters and absolute git are confined by the seatbelt for filesystem writes outside the profile's writable roots, including a push to a local bare repository.
 - Verification of a Grok job is an argv, unless the operator explicitly opts into legacy shell.
 
-## What v0.2 does not claim
+## What the current tree does not claim
 
-- The provider seatbelt blocks network git push. It allows network so the model API works. That is why a clean real probe is `PASS_WITH_LIMITATIONS`.
-- Grok's own `--sandbox` flag is the filesystem jail. The seatbelt is.
-- Command allowlists, the PATH shim, or the prompt are filesystem containment.
+- The provider seatbelt blocks network git push. It allows network so the model API works, and child processes inherit that network. That is why a clean real probe is `PASS_WITH_LIMITATIONS`.
+- Grok's `--sandbox` flag is not the filesystem jail. Nightshift omits it because nested sandbox setup fails inside the seatbelt. The seatbelt is the jail.
+- Command allowlists, the PATH shim, or the prompt are filesystem or network containment.
 - Redaction finds every secret.
 - The morning report is a complete audit of every side effect. It is a summary plus the integrity result.
 - Unattended execution is safe for every job an operator can write. Verification argv is trusted operator input.

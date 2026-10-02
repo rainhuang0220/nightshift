@@ -139,7 +139,7 @@ def _validate(data: dict) -> list[str]:
         errors.append("base_ref must be a non-empty string")
     provider = data["provider"]
     if provider == "cursor":
-        errors.append("provider 'cursor' is not implemented in v0.1")
+        errors.append("provider 'cursor' is not implemented")
     elif provider not in _PROVIDERS:
         errors.append("provider must be 'grok' or 'fake'")
     if "model" in data and data["model"] is not None and not isinstance(data["model"], str):

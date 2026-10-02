@@ -27,6 +27,7 @@ from nightshift.providers.base import terminate_process
 from nightshift.queue import claim_next
 from nightshift.finalize import check_stored_integrity, decide_final, extension_audit_ok
 from nightshift.runner import execute_run, publish_report, run_verification_only
+from nightshift.runtime import scrub_per_run_auth
 
 TERMINAL_VALUES = {state.value for state in TERMINAL_STATES}
 RETRYABLE_VALUES = {state.value for state in RETRYABLE_STATES}
@@ -110,6 +111,16 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
     return RecoveryDecision("already_terminal", "leave", None, f"unhandled state {run.state}", False)
 
 
+def _scrub_recovered_auth(config: Config, run: RunRecord) -> None:
+    """Drop a per-run auth copy left behind by a crash, cancel, or interrupt."""
+    if run.run_dir:
+        scrub_per_run_auth(Path(run.run_dir))
+        return
+    candidate = config.runs_dir / run.run_id
+    if candidate.exists():
+        scrub_per_run_auth(candidate)
+
+
 def probe_run(run: RunRecord) -> ProcessProbe:
     token = ""
     if isinstance(run.process_meta, dict):
@@ -121,6 +132,7 @@ def probe_run(run: RunRecord) -> ProcessProbe:
 
 def recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:
     run = db.require_run(run_id)
+    _scrub_recovered_auth(config, run)
     decision = classify_recovery(run, probe_run(run))
     if decision.launch_provider:
         raise NightshiftError("recover refused to launch a provider")
@@ -217,6 +229,7 @@ def cancel_run(config: Config, db: Database, locks: LockManager, run_id: str) ->
         pgid = int(raw) if isinstance(raw, int) else None
     if run.pid and process_matches(run.pid, token):
         terminate_process(run.pid, pgid)
+    _scrub_recovered_auth(config, run)
     if run.state == RunState.QUEUED.value:
         db.transition(run_id, RunState.CANCELLED.value, "cancelled", failure_reason="cancelled")
     elif run.state in {RunState.PREPARING.value, RunState.RUNNING.value, RunState.VERIFYING.value}:

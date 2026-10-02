@@ -112,4 +112,4 @@ success_criteria = [
 
 Nightshift writes `runs/<run-id>/prompt.final.md` by prefixing the job prompt with a policy preamble. The preamble tells the model to stay in the isolated workspace and that the original checkout is off limits. It is an instruction, not a security boundary.
 
-The child process sees a private `HOME`, `GROK_HOME=state/grok-profile` (as an absolute path only inside the child), `GROK_MEMORY=0`, and `GROK_WORKFLOWS=0`. It does not see the operator's normal Grok skills, plugins, hooks, or MCP credentials.
+The child process sees a private `HOME` and a per-run `GROK_HOME` (`runs/<id>/grok-home`, absolute only inside the child), `GROK_MEMORY=0`, and `GROK_WORKFLOWS=0`. It does not see the operator's normal Grok skills, plugins, hooks, or MCP credentials. The original source checkout is not a read root.

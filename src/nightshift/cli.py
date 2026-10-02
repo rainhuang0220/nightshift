@@ -125,7 +125,7 @@ def _auth(config: Config, args: argparse.Namespace) -> int:
     if args.auth_command != "grok":
         print("error: unknown auth command", file=sys.stderr)
         return EXIT_USAGE
-    profile = config.grok_profile()
+    profile = config.auth_store()
     if args.grok_auth_command == "status":
         status = auth_status(profile)
         print(f"auth {status['auth']}")
@@ -147,7 +147,7 @@ def _safety(config: Config, args: argparse.Namespace) -> int:
         return EXIT_USAGE
     from nightshift.probe import run_safety_probe
 
-    code, text = run_safety_probe(args.provider, profile=config.grok_profile())
+    code, text = run_safety_probe(args.provider, profile=config.auth_store())
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
     return code
 

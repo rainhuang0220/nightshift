@@ -22,9 +22,8 @@ class FakeProvider:
         if request.session_id:
             argv.append(request.session_id)
         env = dict(request.env)
-        root = package_pythonpath()
-        current = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = root if not current else root + os.pathsep + current
+        if not env.get("PYTHONPATH"):
+            env["PYTHONPATH"] = package_pythonpath()
         mode = os.environ.get("NIGHTSHIFT_FAKE_RESULT", "success")
         env["NIGHTSHIFT_FAKE_RESULT"] = mode
         env["NIGHTSHIFT_WRITE_SCOPE"] = request.write_scope

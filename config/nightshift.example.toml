@@ -25,3 +25,11 @@ permission_mode = "dontAsk"
 [policy]
 # Failed and cancelled worktrees are kept unless this is true.
 destroy_failed_worktrees = false
+
+# Optional toolchain directories the provider may read in addition to the
+# isolated workspace, the run directory, and required system paths. Relative
+# paths resolve from the Nightshift root. The operator home is refused.
+# A job prompt cannot add roots. Leave this unset unless a compiler or SDK
+# lives outside the default system roots.
+# [containment]
+# read_roots = ["relative/toolchain"]

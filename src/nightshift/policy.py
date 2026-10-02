@@ -213,7 +213,7 @@ def render_preamble(job: Job) -> str:
             "- change global or system git configuration",
             "- read or write credentials, tokens, or SSH keys",
             "",
-            "Stay inside the workspace. Local commits in this worktree are allowed",
+            "Stay inside the workspace. Local commits in this workspace are allowed",
             "when the job write scope is workspace. Leave verification to Nightshift.",
             "",
             "---",

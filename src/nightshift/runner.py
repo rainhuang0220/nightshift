@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from nightshift.config import Config
-from nightshift.containment import contained_run, operator_read_denies, sandbox_available, write_profile
+from nightshift.containment import build_read_policy, contained_run, sandbox_available, write_profile
 from nightshift.db import Database
 from nightshift.extensions import neutralize_project_extensions, project_instruction_names, run_inspect
 from nightshift.finalize import (
@@ -37,12 +37,18 @@ from nightshift.models import (
     exit_code_for_state,
     utc_now,
 )
-from nightshift.policy import build_policy, minimal_env, package_pythonpath, scrub_text
+from nightshift.policy import build_policy, minimal_env, scrub_text
 from nightshift.priv import ensure_private_dir, write_private_text
 from nightshift.providers import get_provider
 from nightshift.providers.base import ProviderRequest
 from nightshift.report import ReportInputs, extract_findings, extract_metrics, render_report, summarize_stream
-from nightshift.runtime import apply_runtime_env, prepare_runtime_dirs
+from nightshift.runtime import (
+    apply_runtime_env,
+    prepare_run_grok_home,
+    prepare_runtime_dirs,
+    scrub_per_run_auth,
+    stage_pythonpath,
+)
 from nightshift.workspace import WorkspaceError, cleanup_workspace, import_instructions, inspect_source, prepare_workspace
 
 TERMINAL_VALUES = {state.value for state in TERMINAL_STATES}
@@ -163,7 +169,18 @@ def execute_run(
             instructions=instructions,
         )
         db.update_run(run_id, invocation=invocation)
-        profile = _provider_profile(config, run_dir, dest, network=job.provider == "grok")
+        profile = _provider_profile(
+            config,
+            run_dir,
+            dest,
+            source=repo,
+            network=job.provider == "grok",
+        )
+        boundary = _read_boundary(profile, dest, env, repo)
+        invocation["trust_boundary"] = boundary
+        db.update_run(run_id, invocation=invocation)
+        if boundary["source_read_isolation"] == "fail" or boundary["operator_home_read_isolation"] == "fail":
+            raise RunFailed("provider seatbelt allowed a read outside the isolated workspace")
         _write_metadata(run_dir, db.require_run(run_id))
         run = db.transition(
             run_id,
@@ -241,7 +258,7 @@ def execute_run(
             env=env,
             log_path=run_dir / "verification.log",
             timeout=float(job.max_runtime_seconds),
-            profile=_verification_profile(config, run_dir, dest),
+            profile=_verification_profile(config, run_dir, dest, repo),
         )
         del ver_text
         db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
@@ -295,6 +312,7 @@ def execute_run(
             pass
         return db.require_run(run_id)
     finally:
+        scrub_per_run_auth(run_dir)
         locks.release(run_id)
 
 
@@ -323,7 +341,7 @@ def run_verification_only(config: Config, db: Database, run_id: str) -> RunRecor
         env=env,
         log_path=run_dir / "verification.log",
         timeout=float(job.max_runtime_seconds or run.max_runtime_seconds or 600),
-        profile=_verification_profile(config, run_dir, workspace),
+        profile=_verification_profile(config, run_dir, workspace, source),
     )
     db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
     current = db.require_run(run_id)
@@ -401,6 +419,7 @@ def publish_report(
             )
     if missing:
         uncertainty.append("Expected artifacts missing: " + ", ".join(missing))
+    boundary = (run.invocation or {}).get("trust_boundary") or {}
     info = ReportInputs(
         run_id=run.run_id,
         job_id=run.job_id,
@@ -438,6 +457,12 @@ def publish_report(
         recovery_class=run.recovery_class,
         isolation=str((run.invocation or {}).get("isolation") or job.isolation or "clone"),
         import_note=import_instructions(str((run.invocation or {}).get("isolation") or job.isolation or "clone")),
+        grok_home_scope=str(boundary.get("grok_home_scope") or "per-run"),
+        source_read_isolation=str(boundary.get("source_read_isolation") or "not-probed"),
+        operator_home_read_isolation=str(boundary.get("operator_home_read_isolation") or "not-probed"),
+        source_integrity=_source_integrity_label(run),
+        extension_audit=_extension_audit_label(run),
+        network_containment=str(boundary.get("network_containment") or "accepted limitation"),
     )
     text = render_report(info)
     report_path = run_dir / "report.md"
@@ -599,8 +624,9 @@ def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run
     hooks = run_dir / "empty-hooks"
     gitconfig = run_dir / "empty-gitconfig"
     write_private_text(gitconfig, "")
-    profile = config.grok_profile()
-    runtime_home, private_tmp = prepare_runtime_dirs(run_dir, profile)
+    grok_home = prepare_run_grok_home(run_dir, config.auth_store())
+    runtime_home, private_tmp = prepare_runtime_dirs(run_dir)
+    staged = stage_pythonpath(run_dir)
     real = {
         "git": shutil.which(GIT_BIN) or shutil.which("git") or "",
         "gh": shutil.which("gh") or "",
@@ -614,16 +640,13 @@ def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run
         workspace=workspace,
         source=source,
         hooks_path=hooks,
-        pythonpath=package_pythonpath(),
+        pythonpath=str(staged),
     )
     parent = dict(os.environ)
     path = str(bin_dir) + os.pathsep + parent.get("PATH", "")
-    pythonpath = package_pythonpath()
-    if parent.get("PYTHONPATH"):
-        pythonpath = pythonpath + os.pathsep + parent["PYTHONPATH"]
     extra = {
         "PATH": path,
-        "PYTHONPATH": pythonpath,
+        "PYTHONPATH": str(staged),
         "GIT_CONFIG_GLOBAL": str(gitconfig),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
@@ -635,26 +658,126 @@ def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run
         if binary:
             extra[f"NIGHTSHIFT_REAL_{tool.upper()}"] = binary
     env = minimal_env(parent, extra=extra)
-    return apply_runtime_env(env, runtime_home=runtime_home, grok_home=profile, private_tmp=private_tmp)
+    return apply_runtime_env(env, runtime_home=runtime_home, grok_home=grok_home, private_tmp=private_tmp)
 
 
-def _provider_profile(config: Config, run_dir: Path, workspace: Path, *, network: bool) -> Path:
-    writable = [workspace, run_dir, config.grok_profile()]
+def _provider_profile(
+    config: Config,
+    run_dir: Path,
+    workspace: Path,
+    *,
+    source: Path,
+    network: bool,
+) -> Path:
     return write_profile(
         run_dir / "provider.sb",
-        writable=writable,
+        writable=[workspace, run_dir],
         network=network,
-        read_deny=operator_read_denies(Path.home()),
+        read_policy=_read_policy(config, run_dir, workspace, source),
     )
 
 
-def _verification_profile(config: Config, run_dir: Path, workspace: Path) -> Path:
-    del config
+def _verification_profile(config: Config, run_dir: Path, workspace: Path, source: Path) -> Path:
     return write_profile(
         run_dir / "verification.sb",
         writable=[workspace, run_dir],
         network=False,
-        read_deny=operator_read_denies(Path.home()),
+        read_policy=_read_policy(config, run_dir, workspace, source),
+    )
+
+
+def _source_integrity_label(run: RunRecord) -> str:
+    if not run.source_repo or not run.source_integrity:
+        if "SOURCE_INTEGRITY_VIOLATION" in (run.failure_reason or ""):
+            return "fail"
+        return "not-probed"
+    from nightshift.finalize import check_stored_integrity
+
+    return "pass" if check_stored_integrity(run.source_repo, run.source_integrity).ok else "fail"
+
+
+def _extension_audit_label(run: RunRecord) -> str:
+    from nightshift.finalize import extension_audit_ok
+
+    return "pass" if extension_audit_ok(run.provider, run.invocation) else "fail"
+
+
+def _read_boundary(profile: Path, workspace: Path, env: dict[str, str], source: Path) -> dict[str, str]:
+    """Enforcement evidence for the provider profile. Does not ask the model."""
+    return {
+        "grok_home_scope": "per-run",
+        "source_read_isolation": _source_read_result(profile, workspace, env, source),
+        "operator_home_read_isolation": _operator_home_read_result(profile, workspace, env),
+        "network_containment": "accepted limitation",
+    }
+
+
+def _source_read_result(profile: Path, workspace: Path, env: dict[str, str], source: Path) -> str:
+    target = source / ".git" / "HEAD"
+    if not target.is_file():
+        return "not-probed"
+    try:
+        needle = target.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return "not-probed"
+    if not needle:
+        return "not-probed"
+    if _readers_saw(profile, workspace, env, target, needle):
+        return "fail"
+    return "pass"
+
+
+def _operator_home_read_result(profile: Path, workspace: Path, env: dict[str, str]) -> str:
+    import uuid
+
+    canary = Path.home() / f"nightshift-read-canary-{uuid.uuid4().hex}"
+    needle = f"synthetic-operator-home-canary-{canary.name}"
+    try:
+        ensure_private_dir(canary)
+        target = canary / "outside-private.txt"
+        write_private_text(target, needle + "\n")
+        if _readers_saw(profile, workspace, env, target, needle):
+            return "fail"
+        return "pass"
+    except OSError:
+        return "not-probed"
+    finally:
+        shutil.rmtree(canary, ignore_errors=True)
+
+
+def _readers_saw(profile: Path, workspace: Path, env: dict[str, str], target: Path, needle: str) -> bool:
+    quoted = str(target)
+    commands = [
+        ["cat", quoted],
+        ["/bin/cat", quoted],
+        ["/usr/bin/python3", "-c", f"print(open({quoted!r}).read())"],
+        ["/bin/sh", "-c", f"cat {quoted}"],
+    ]
+    child = dict(env)
+    child.setdefault("PATH", "/usr/bin:/bin")
+    for argv in commands:
+        try:
+            _code, output = contained_run(argv, cwd=workspace, env=child, profile=profile, timeout=20)
+        except OSError:
+            continue
+        if needle in output:
+            return True
+    return False
+
+
+def _read_policy(config: Config, run_dir: Path, workspace: Path, source: Path):
+    runtime_roots = [
+        workspace,
+        run_dir,
+        run_dir / "runtime-home",
+        run_dir / "grok-home",
+        run_dir / "tmp",
+        run_dir / "pythonpath",
+    ]
+    return build_read_policy(
+        runtime_roots=runtime_roots,
+        source_root=source,
+        explicit_read_roots=list(config.explicit_read_roots),
     )
 
 
@@ -687,7 +810,8 @@ def _invocation(
         "web_search_disabled": bool(policy.disable_web_search),
         "deny_count": len(policy.deny),
         "allow_count": len(policy.allow),
-        "grok_home": "state/grok-profile",
+        "grok_home": "per-run",
+        "grok_home_scope": "per-run",
         "isolation": isolation,
         "neutralized": list(neutralized),
         "untrusted_instructions": list(instructions),

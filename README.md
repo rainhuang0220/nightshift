@@ -79,14 +79,14 @@ The default probe is deterministic. It builds a temporary repository and does no
 
 ## Grok auth bootstrap
 
-Unattended Grok uses a Nightshift profile at `state/grok-profile/`, not your normal Grok home.
+Unattended Grok keeps auth at `state/credentials/grok/auth.json` and uses a new `GROK_HOME` per run, not your normal Grok home.
 
 ```bash
 nightshift auth grok bootstrap
 nightshift auth grok status
 ```
 
-Bootstrap copies only the Grok auth file into that profile. The directory is mode 0700 and the file is mode 0600. The command does not print the file. The profile is gitignored.
+Bootstrap copies only the Grok auth file into that store. The directory is mode 0700 and the file is mode 0600. The command does not print the file. The store is gitignored. Each run copies it into `runs/<id>/grok-home` and removes that copy when the run ends.
 
 ## Real safety probe
 

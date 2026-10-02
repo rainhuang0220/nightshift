@@ -182,7 +182,7 @@ A live PID is accepted only when `ps` shows the session token. A recycled PID is
 
 The child also gets `GROK_MEMORY=0` and `GROK_WORKFLOWS=0`.
 
-Invocation metadata stored on the run records binary version, model, session id, permission mode, the requested Grok sandbox profile name, the seatbelt label, max turns, memory and subagent flags, web-search status, deny and allow counts, the label `state/grok-profile`, isolation, neutralized relative paths, and the extension-audit counts. It does not store secrets or an absolute credential path.
+Invocation metadata stored on the run records binary version, model, session id, permission mode, the requested Grok sandbox profile name, the seatbelt label, max turns, memory and subagent flags, web-search status, deny and allow counts, the label `per-run` for `GROK_HOME`, isolation, neutralized relative paths, and the extension-audit counts. It does not store secrets or an absolute credential path.
 
 `NIGHTSHIFT_FORBID_GROK=1` blocks the launch before `inspect`. That variable is an operator circuit breaker for tests.
 

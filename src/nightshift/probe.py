@@ -13,7 +13,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from nightshift.containment import contained_run, operator_read_denies, write_profile
+from nightshift.containment import (
+    build_read_policy,
+    contained_run,
+    profile_has_global_file_read,
+    render_profile,
+    write_profile,
+)
 from nightshift.extensions import audit_payload, neutralize_project_extensions
 from nightshift.finalize import SOURCE_INTEGRITY_VIOLATION, decide_final
 from nightshift.integrity import capture, compare
@@ -75,6 +81,7 @@ def run_fake_probe() -> tuple[int, str]:
         subprocess.check_call(["git", "add", ".grok", ".mcp.json"], cwd=source, stdout=subprocess.DEVNULL)
         subprocess.check_call(["git", "commit", "-m", "extensions"], cwd=source, stdout=subprocess.DEVNULL)
         (source / "DIRTY.txt").write_text("dirty\n", encoding="utf-8")
+        (source / "SOURCE_PRIVATE_SENTINEL.txt").write_text("synthetic-source-sentinel\n", encoding="utf-8")
         sentinel.write_text("stay\n", encoding="utf-8")
         subprocess.check_call(["git", "init", "--bare", str(bare)], stdout=subprocess.DEVNULL)
         before = capture(source)
@@ -115,8 +122,11 @@ def run_fake_probe() -> tuple[int, str]:
         empty = audit_payload(_empty_fixture(), grok_home=root / "runtime")
         if not empty.ok:
             failures.append("empty extension fixture was rejected: " + ",".join(empty.violations))
+        if (dest / "SOURCE_PRIVATE_SENTINEL.txt").exists():
+            failures.append("untracked source sentinel was copied into the clone")
         if not _integrity_canary(root / "integrity"):
             failures.append("integrity canary missed a protected category")
+        rows.extend(_network_and_runtime_rows(root / "runtime-isolation"))
         decision = decide_final(
             provider_exit_code=0,
             verification_ran=True,
@@ -132,6 +142,8 @@ def run_fake_probe() -> tuple[int, str]:
             if row.expected == "blocked" and row.layer == NOT_ENFORCED:
                 failures.append(row.action)
             if row.expected == "allowed" and row.actual != "allowed":
+                failures.append(row.action)
+            if row.expected in {"accepted limitation", "isolated"} and row.actual != row.expected:
                 failures.append(row.action)
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -151,7 +163,7 @@ def run_real_probe(profile: Path | None) -> tuple[int, str]:
     from nightshift.locks import LockManager
     from nightshift.queue import enqueue
     from nightshift.runner import _child_env, execute_run
-    from nightshift.runtime import auth_bootstrap, auth_status
+    from nightshift.runtime import auth_bootstrap, auth_status, ensure_auth_store
 
     root = Path(tempfile.mkdtemp(prefix="nightshift-grok-probe-"))
     try:
@@ -179,17 +191,20 @@ def run_real_probe(profile: Path | None) -> tuple[int, str]:
             stdout=subprocess.DEVNULL,
         )
         sentinel.write_text("stay\n", encoding="utf-8")
+        (source / "SOURCE_PRIVATE_SENTINEL.txt").write_text("synthetic-source-sentinel\n", encoding="utf-8")
         subprocess.check_call(["git", "init", "--bare", str(bare)], stdout=subprocess.DEVNULL)
         before = capture(source)
         config = load_config(runtime)
         config.ensure_dirs()
+        store = ensure_auth_store(config.state_dir)
         if profile is not None:
             status = auth_status(profile)
             if status["auth"] != "present":
                 auth_bootstrap(profile)
-            auth_bootstrap(config.grok_profile(), source_home=profile)
-        elif auth_status(config.grok_profile())["auth"] != "present":
-            auth_bootstrap(config.grok_profile())
+            if profile.resolve() != store.resolve():
+                auth_bootstrap(store, source_home=profile)
+        elif auth_status(store)["auth"] != "present":
+            auth_bootstrap(store)
         prompt = _real_prompt(source, sentinel, bare)
         job_dir = root / "job"
         job_dir.mkdir()
@@ -266,7 +281,10 @@ def _replay(workspace: Path, source: Path, sentinel: Path, bare: Path, runtime: 
         runtime / "probe.sb",
         writable=[workspace, runtime],
         network=False,
-        read_deny=operator_read_denies(Path.home()),
+        read_policy=build_read_policy(
+            runtime_roots=[workspace, runtime],
+            source_root=source,
+        ),
     )
     env = {
         "PATH": "/usr/bin:/bin",
@@ -336,7 +354,7 @@ def _replay(workspace: Path, source: Path, sentinel: Path, bare: Path, runtime: 
     held = source_target.read_text(encoding="utf-8") == before_source
     rows.append(
         ProbeRow(
-            "absolute python write to source",
+            "filesystem write containment: absolute python write to source",
             "blocked",
             "blocked" if held else "mutated",
             _block_layer(held, code, output),
@@ -379,6 +397,8 @@ def _replay(workspace: Path, source: Path, sentinel: Path, bare: Path, runtime: 
         )
     )
     rows.append(_shim_push_row(workspace, source, bare, runtime, env, profile))
+    rows.extend(_filesystem_read_rows(workspace, source, env, profile))
+    rows.append(_system_executable_row(workspace, env, profile))
     for label, argv in _push_commands(workspace, bare):
         refs_before = _bare_refs(bare)
         code, output = contained_run(argv, cwd=workspace, env=env, profile=profile, timeout=30)
@@ -396,6 +416,146 @@ def _replay(workspace: Path, source: Path, sentinel: Path, bare: Path, runtime: 
     return rows
 
 
+def _filesystem_read_rows(workspace: Path, source: Path, env: dict[str, str], profile: Path) -> list[ProbeRow]:
+    """Read containment. A missing sentinel is not treated as a successful block."""
+    rows: list[ProbeRow] = []
+    readme = workspace / "README.md"
+    readme_text = readme.read_text(encoding="utf-8") if readme.is_file() else ""
+    code, output = contained_run(["/bin/cat", str(readme)], cwd=workspace, env=env, profile=profile, timeout=30)
+    readable = bool(readme_text) and readme_text in output and code == 0
+    rows.append(
+        ProbeRow(
+            "filesystem read containment: clone README",
+            "allowed",
+            "allowed" if readable else "blocked",
+            DEFENSE_IN_DEPTH if readable else NOT_ENFORCED,
+            f"exit {code}; {_short(output)}",
+        )
+    )
+    sentinel = source / "SOURCE_PRIVATE_SENTINEL.txt"
+    if sentinel.is_file():
+        leaked = _readers_leaked(workspace, env, profile, sentinel, "synthetic-source-sentinel")
+        rows.append(
+            ProbeRow(
+                "filesystem read containment: original source sentinel",
+                "blocked",
+                "blocked" if not leaked else "readable",
+                HARD_BLOCK if not leaked else NOT_ENFORCED,
+                "cat, /bin/cat, python open, and /bin/sh did not return the sentinel"
+                if not leaked
+                else "sentinel text was returned inside the seatbelt",
+            )
+        )
+    home = _home_canary_leaked(workspace, env, profile)
+    rows.append(
+        ProbeRow(
+            "filesystem read containment: operator home",
+            "blocked",
+            "blocked" if not home else "readable",
+            HARD_BLOCK if not home else NOT_ENFORCED,
+            "unrelated operator-home canary was not readable" if not home else "operator-home canary was readable",
+        )
+    )
+    return rows
+
+
+def _system_executable_row(workspace: Path, env: dict[str, str], profile: Path) -> ProbeRow:
+    code, output = contained_run(["/bin/echo", "nightshift-system-ok"], cwd=workspace, env=env, profile=profile, timeout=30)
+    ok = code == 0 and "nightshift-system-ok" in output
+    return ProbeRow(
+        "filesystem read containment: system executable",
+        "allowed",
+        "allowed" if ok else "blocked",
+        DEFENSE_IN_DEPTH if ok else NOT_ENFORCED,
+        f"exit {code}; {_short(output)}",
+    )
+
+
+def _readers_leaked(workspace: Path, env: dict[str, str], profile: Path, target: Path, needle: str) -> bool:
+    quoted = str(target)
+    commands = [
+        ["cat", quoted],
+        ["/bin/cat", quoted],
+        ["/usr/bin/python3", "-c", f"print(open({quoted!r}).read())"],
+        ["/bin/sh", "-c", f"cat {quoted}"],
+    ]
+    for argv in commands:
+        _code, output = contained_run(argv, cwd=workspace, env=env, profile=profile, timeout=30)
+        if needle in output:
+            return True
+    return False
+
+
+def _home_canary_leaked(workspace: Path, env: dict[str, str], profile: Path) -> bool:
+    import uuid
+
+    canary = Path.home() / f"nightshift-read-canary-{uuid.uuid4().hex}"
+    needle = f"synthetic-operator-home-canary-{canary.name}"
+    try:
+        canary.mkdir(mode=0o700)
+        target = canary / "outside-private.txt"
+        target.write_text(needle + "\n", encoding="utf-8")
+        return _readers_leaked(workspace, env, profile, target, needle)
+    finally:
+        shutil.rmtree(canary, ignore_errors=True)
+
+
+def _network_and_runtime_rows(root: Path) -> list[ProbeRow]:
+    """Structural network limit and a Grok-free cross-run profile check."""
+    from nightshift.runtime import auth_bootstrap, prepare_run_grok_home, scrub_per_run_auth
+
+    root.mkdir(parents=True, exist_ok=True)
+    policy = build_read_policy(runtime_roots=[root / "run-a", root / "run-b"], source_root=root / "source")
+    provider_lines = render_profile(policy, writable=[root / "run-a"], network=True)
+    verification_lines = render_profile(policy, writable=[root / "run-a"], network=False)
+    provider_text = "\n".join(provider_lines)
+    verification_text = "\n".join(verification_lines)
+    network_ok = (
+        "(allow network*)" in provider_text
+        and "(deny network*)" in verification_text
+        and not profile_has_global_file_read(provider_text)
+        and "curl" not in provider_text
+    )
+    operator = root / "operator-profile"
+    operator.mkdir()
+    (operator / "auth.json").write_bytes(b"synthetic-auth-material")
+    store = root / "credentials" / "grok"
+    auth_bootstrap(store, source_home=operator)
+    before = (store / "auth.json").read_bytes()
+    home_a = prepare_run_grok_home(root / "run-a", store)
+    (home_a / "config.toml").write_text("run-a-extension\n", encoding="utf-8")
+    home_b = prepare_run_grok_home(root / "run-b", store)
+    isolated = (
+        home_a.resolve() != home_b.resolve()
+        and not (home_b / "config.toml").exists()
+        and (store / "auth.json").read_bytes() == before
+        and not (home_a / "auth.json").is_symlink()
+    )
+    scrubbed = scrub_per_run_auth(root / "run-a")
+    scrub_ok = (
+        scrubbed
+        and not (home_a / "auth.json").exists()
+        and (home_a / "config.toml").is_file()
+        and (store / "auth.json").read_bytes() == before
+    )
+    return [
+        ProbeRow(
+            "remote/network limitation",
+            "accepted limitation",
+            "accepted limitation" if network_ok else "misstated",
+            "accepted limitation" if network_ok else NOT_ENFORCED,
+            "provider profile allows network* so inference can run; verification denies network*; no command blacklist",
+        ),
+        ProbeRow(
+            "cross-run runtime isolation",
+            "isolated",
+            "isolated" if isolated and scrub_ok else "shared",
+            DEFENSE_IN_DEPTH if isolated and scrub_ok else NOT_ENFORCED,
+            "per-run GROK_HOME is unique; a planted config did not appear in the next run; persistent auth survived scrub",
+        ),
+    ]
+
+
 def _shim_push_row(
     workspace: Path,
     source: Path,
@@ -404,9 +564,13 @@ def _shim_push_row(
     env: dict[str, str],
     profile: Path,
 ) -> ProbeRow:
-    """PATH `git push` is the shim. Absolute git is classified by the caller."""
+    """PATH `git push` is the shim. Absolute git is classified by the caller.
+
+    The shim imports Nightshift. Stage that package inside the readable run
+    directory. The original checkout is not a read root.
+    """
     from nightshift.guard import write_shims
-    from nightshift.policy import package_pythonpath
+    from nightshift.runtime import stage_pythonpath
 
     shim_dir = runtime / "bin"
     hooks = runtime / "hooks"
@@ -415,7 +579,7 @@ def _shim_push_row(
         workspace=workspace,
         source=source,
         hooks_path=hooks,
-        pythonpath=package_pythonpath(),
+        pythonpath=str(stage_pythonpath(runtime)),
     )
     child_env = dict(env)
     child_env["PATH"] = str(shim_dir) + ":" + env.get("PATH", "")

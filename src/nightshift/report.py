@@ -44,6 +44,12 @@ class ReportInputs:
     human_review_required: bool = True
     recovery_class: str = ""
     isolation: str = "clone"
+    grok_home_scope: str = "per-run"
+    source_read_isolation: str = "not-probed"
+    operator_home_read_isolation: str = "not-probed"
+    source_integrity: str = "not-probed"
+    extension_audit: str = "not-probed"
+    network_containment: str = "accepted limitation"
     import_note: str = (
         "Nightshift does not merge or push. Review the isolated workspace and import commits by hand."
     )
@@ -171,6 +177,14 @@ def render_report(info: ReportInputs) -> str:
             f"Human review required: {review}",
             f"- Isolation: {info.isolation or 'clone'}",
             f"- Import: {info.import_note}",
+            "",
+            "## Trust boundary",
+            f"- runtime GROK_HOME scope: {info.grok_home_scope or 'per-run'}",
+            f"- source read isolation: {info.source_read_isolation or 'not-probed'}",
+            f"- operator-home read isolation: {info.operator_home_read_isolation or 'not-probed'}",
+            f"- source integrity: {info.source_integrity or 'not-probed'}",
+            f"- extension audit: {info.extension_audit or 'not-probed'}",
+            f"- network containment: {info.network_containment or 'accepted limitation'}",
             "",
             "## Inspect",
             "These commands are read-only.",

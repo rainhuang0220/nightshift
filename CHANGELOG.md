@@ -7,6 +7,18 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Provider filesystem reads are deny-by-default. The seatbelt allows required system and toolchain reads, denies the operator home and the original source checkout, then re-allows only the isolated workspace, the run directory, the private runtime home, the per-run `GROK_HOME`, the resolved tool path, and optional `[containment] read_roots`. Ancestor directories of those roots get `file-read-metadata` only, so a path walk can stat them without listing or reading their contents. There is no global file-read allow. A job prompt cannot add a read root.
+- `GROK_HOME` is a new directory for each run (`runs/<id>/grok-home`). The persistent auth file is `state/credentials/grok/auth.json` (directory mode 0700, file mode 0600, gitignored). Each launch copies that file into the per-run home. Exit, cancel, interrupt, and recovery remove the copy. The persistent store is not deleted and is not provider-writable.
+- Protected Git hooks and worktree metadata are content-hashed, including symlink targets. A protected tree file above 1,000,000 bytes, or an unreadable protected path, fails the snapshot closed. The Git object database is not hashed.
+
+### Changed
+
+- The morning report includes a short trust-boundary section: per-run `GROK_HOME`, source read isolation, operator-home read isolation, source integrity, extension audit, and network containment.
+- `nightshift safety probe` reports filesystem write containment, filesystem read containment, the accepted provider-network limitation, and cross-run runtime isolation as separate rows.
+- The policy preamble says local commits are in the workspace. The unimplemented `cursor` provider error no longer says `v0.1`.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added
