@@ -110,7 +110,7 @@ git -C <dest> remote remove origin
 git -C <dest> checkout --detach <recorded-revision>
 ```
 
-The clone then gets an empty local `core.hooksPath`, the identity `Nightshift <nightshift@localhost>`, and `commit.gpgsign=false`. `--shared` is not used. Untracked dirty files in the source are not copied. A commit in the clone does not create or update source refs, and it does not register a source worktree.
+The clone and the detached checkout already run with hooks and templates disabled, using an invocation-scoped Git config that does not read or edit the operator's global config. The clone then gets an empty local `core.hooksPath`, the identity `Nightshift <nightshift@localhost>`, and `commit.gpgsign=false`. `--shared` is not used. Untracked dirty files in the source are not copied. A commit in the clone does not create or update source refs, and it does not register a source worktree.
 
 `WorktreeWorkspaceBackend` is `isolation = "worktree"`. Its instructions say:
 
@@ -131,10 +131,10 @@ NOT DEFAULT FOR UNATTENDED JOBS
 5. The post-prepare snapshot is stored. Later success checks compare against that snapshot. Nightshift does not clean, reset, stash, or checkout the source.
 6. Project extension files (`.grok`, `.mcp.json`, `.cursor/mcp.json`, `.cursor/hooks.json`, `.cursor/hooks`, `.claude`) are moved or unlinked inside the clone only. Symlinks are unlinked and not followed. `AGENTS.md` and `CLAUDE.md` stay, and are recorded as untrusted instructions.
 7. A Grok job with a legacy shell verification step is blocked unless `allow_legacy_shell_verification` is true. A missing `sandbox-exec` blocks the run. `NIGHTSHIFT_FORBID_GROK=1` blocks a Grok launch before `inspect`.
-8. Otherwise a Grok launch runs `grok inspect --json` in the sanitized environment. A failing `ExtensionSurfaceAudit` raises `BLOCKED_EXTENSION_SURFACE` and does not start the model.
-9. The provider starts with the clone as cwd, a new session id, isolated `HOME` and `GROK_HOME`, and a seatbelt profile. Stdout and stderr are scrubbed on the way to disk. The PID and a match token (the session id on the argv) are stored.
-10. After the child exits, the snapshotted verification plan runs in the clone under a second seatbelt that denies network. The plan comes from the job recorded before launch, not from provider output. A timeout kills the child process group and returns exit 124.
-11. `decide_final` is the only success decision. `SUCCEEDED` requires provider exit exactly 0, verification that ran and exited 0, a workspace that exists, a passing integrity check, and a passing safety audit.
+8. Otherwise a Grok launch runs `grok inspect --json` in the sanitized environment, first under the preflight seatbelt. A failing `ExtensionSurfaceAudit` raises `BLOCKED_EXTENSION_SURFACE` and does not start the model. Inspect is its own cancellable process group. Nightshift records the phase (`preparing`, `inspect`, `provider`, or `verifying`), the child pid and process group when there is one, and the process start time.
+9. The provider starts with the clone as cwd, a new session id, isolated `HOME` and `GROK_HOME`, and a seatbelt profile. Its writable roots are the workspace (unless `write_scope` is `none`), `grok-home`, `runtime-home`, and `tmp` inside `runs/<id>/attempt-<n>/`. Stdout and stderr are scrubbed on the way to disk. The PID, process group, start time, and the session id on the argv are stored. A retry builds `attempt-<n+1>` and does not resume the previous Grok session.
+10. After the child exits, Nightshift builds a fresh verification runtime that the provider could not write, then runs the snapshotted verification plan in the clone under a second seatbelt that denies network. A verification exit of 0 means that declared check passed in the mutable workspace. It does not prove the model could not influence the check. A timeout or cancel kills the verification process group and does not signal Nightshift's own group.
+11. `decide_final` is the only success decision. `SUCCEEDED` requires provider exit exactly 0, verification that ran and exited 0, a workspace that exists, a passing integrity check, and a passing safety audit. A run already marked `CANCELLED` cannot move to `SUCCEEDED`.
 12. The report is written. Locks are released. Workspaces are kept. Failed workspaces are removed only when `destroy_failed_worktrees` is true, and clone removal refuses to delete a path that overlaps the source.
 
 `nightshift run` does the same path without the daemon. The daemon calls `recover` first (no relaunch), then claims while active `PREPARING`/`RUNNING`/`VERIFYING` rows are below `concurrency`. The default concurrency is 1.
@@ -172,7 +172,7 @@ A provider that exited 0, with verification that then exits 0, still becomes `FA
 
 A live PID is accepted only when `ps` shows the session token. A recycled PID is not treated as the child.
 
-`cancel` moves an active run to `CANCELLED`, signals the child process group when the token matches, and releases locks.
+`cancel` records `CANCELLED` before it signals the provider, inspect, or verification process group. It does not signal the preparing controller or Nightshift's own group. Locks stay until that child is gone.
 
 ## Grok adapter
 

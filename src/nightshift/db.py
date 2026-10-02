@@ -12,6 +12,7 @@ from typing import Iterator
 
 from nightshift.models import (
     ACTIVE_STATES,
+    TERMINAL_STATES,
     IllegalTransition,
     NotFoundError,
     RunRecord,
@@ -146,6 +147,61 @@ def _encode(key: str, value):
     if key in _BOOL_FIELDS:
         return 1 if value else 0
     return value
+
+
+class _LockDenied(Exception):
+    """Ownership could not be proved. The open transaction must roll back."""
+
+
+def _acquire_locks_conn(conn: sqlite3.Connection, keys: list[str], run_id: str, pid: int) -> bool:
+    """Inside an open IMMEDIATE transaction: own every key, or change nothing.
+
+    A live owner other than `run_id` fails the call before any delete or insert.
+    Stale rows are removed only after every key has been classified. Same-run
+    ownership is refreshed in place.
+    """
+    from nightshift.locks import pid_alive
+
+    terminal = {state.value for state in TERMINAL_STATES}
+    stale: list[str] = []
+    for key in keys:
+        row = conn.execute(
+            "SELECT lock_key, run_id, pid FROM locks WHERE lock_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None or row["run_id"] == run_id:
+            continue
+        holder = conn.execute("SELECT state FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()
+        holder_terminal = holder is None or holder["state"] in terminal
+        if holder_terminal or not pid_alive(row["pid"]):
+            stale.append(key)
+            continue
+        return False
+    for key in stale:
+        conn.execute("DELETE FROM locks WHERE lock_key = ?", (key,))
+    now = utc_now()
+    for key in keys:
+        row = conn.execute(
+            "SELECT lock_key, run_id FROM locks WHERE lock_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO locks (lock_key, run_id, acquired_at, pid) VALUES (?, ?, ?, ?)",
+                (key, run_id, now, pid),
+            )
+            continue
+        if row["run_id"] != run_id:
+            raise _LockDenied()
+        conn.execute(
+            "UPDATE locks SET acquired_at = ?, pid = ? WHERE lock_key = ? AND run_id = ?",
+            (now, pid, key, run_id),
+        )
+    for key in keys:
+        row = conn.execute("SELECT run_id FROM locks WHERE lock_key = ?", (key,)).fetchone()
+        if row is None or row["run_id"] != run_id:
+            raise _LockDenied()
+    return True
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
@@ -374,20 +430,19 @@ class Database:
             self._conn.execute("DELETE FROM locks WHERE lock_key = ?", (key,))
 
     def write_locks(self, keys: list[str], run_id: str, pid: int) -> None:
-        now = utc_now()
-        with self.transaction():
-            for key in keys:
-                self._conn.execute(
-                    """
-                    INSERT INTO locks (lock_key, run_id, acquired_at, pid)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(lock_key) DO UPDATE SET
-                        run_id = excluded.run_id,
-                        acquired_at = excluded.acquired_at,
-                        pid = excluded.pid
-                    """,
-                    (key, run_id, now, pid),
-                )
+        """Insert lock rows for `run_id`. A live other owner is left unchanged."""
+        self.try_acquire_locks(keys, run_id, pid)
+
+    def try_acquire_locks(self, keys: list[str], run_id: str, pid: int) -> bool:
+        """Acquire every key or none. Never replaces a live owner."""
+        unique = list(dict.fromkeys(key for key in keys if key))
+        if not unique:
+            return True
+        try:
+            with self.transaction() as conn:
+                return _acquire_locks_conn(conn, unique, run_id, pid)
+        except _LockDenied:
+            return False
 
     def release_locks(self, run_id: str) -> None:
         with self.transaction():

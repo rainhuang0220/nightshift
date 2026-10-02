@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -244,30 +245,132 @@ def audit_payload(data: dict, *, grok_home: Path | None = None) -> ExtensionSurf
     )
 
 
-def run_inspect(env: dict[str, str], cwd: Path, *, timeout: float = 60) -> ExtensionSurfaceAudit:
-    """Ask the Grok CLI what it discovers. The caller supplies the sanitized env."""
+def run_inspect(
+    env: dict[str, str],
+    cwd: Path,
+    *,
+    timeout: float = 60,
+    profile: Path | None = None,
+    poll_stop=None,
+    on_pid=None,
+) -> ExtensionSurfaceAudit:
+    """Ask the Grok CLI what it discovers. The caller supplies the sanitized env.
+
+    When `profile` is set, inspect runs under that seatbelt. A contained
+    failure is returned to the caller; this function does not widen the profile.
+    Either path can be cancelled while the child is still running.
+    """
     try:
-        proc = subprocess.run(
-            ["grok", "inspect", "--json"],
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        if profile is not None:
+            from nightshift.containment import contained_run
+
+            code, output = contained_run(
+                ["grok", "inspect", "--json"],
+                cwd=cwd,
+                env=env,
+                profile=profile,
+                timeout=timeout,
+                poll_stop=poll_stop,
+                on_pid=on_pid,
+            )
+        else:
+            code, output = _unsandboxed_command(
+                ["grok", "inspect", "--json"],
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                poll_stop=poll_stop,
+                on_pid=on_pid,
+            )
+        if code != 0:
+            return _failed("inspect failed")
+        payload = _json_object(output)
     except (OSError, subprocess.TimeoutExpired):
         return _failed("inspect failed")
-    if proc.returncode != 0:
-        return _failed("inspect failed")
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
+    if payload is None:
         return _failed("inspect output was not json")
     if not isinstance(payload, dict):
         return _failed("inspect output was not an object")
     home = Path(env["GROK_HOME"]) if env.get("GROK_HOME") else None
     return audit_payload(payload, grok_home=home)
+
+
+def _unsandboxed_command(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    poll_stop=None,
+    on_pid=None,
+) -> tuple[int, str]:
+    """Run a preflight command without a seatbelt, still as its own process group."""
+    import time
+
+    from nightshift.providers.base import terminate_process
+
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None
+    if on_pid is not None:
+        on_pid(proc.pid, pgid)
+    watcher = None
+    if poll_stop is not None:
+        def _watch() -> None:
+            while proc.poll() is None:
+                if poll_stop():
+                    terminate_process(proc.pid, pgid)
+                    return
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate_process(proc.pid, pgid)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+    finally:
+        if watcher is not None:
+            watcher.join(timeout=1)
+    output = (stdout or "") + (stderr or "")
+    code = proc.returncode if proc.returncode is not None else 1
+    return code, output
+
+
+def _json_object(text: str) -> dict | None:
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        else:
+            return payload if isinstance(payload, dict) else None
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def _failed(reason: str) -> ExtensionSurfaceAudit:

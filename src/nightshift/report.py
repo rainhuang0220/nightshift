@@ -50,9 +50,35 @@ class ReportInputs:
     source_integrity: str = "not-probed"
     extension_audit: str = "not-probed"
     network_containment: str = "accepted limitation"
+    inspect_containment: str = "not-probed"
     import_note: str = (
         "Nightshift does not merge or push. Review the isolated workspace and import commits by hand."
     )
+    conclusion: str = ""
+
+
+def provider_conclusion(text: str) -> str:
+    """Join user-visible text events. Thought and usage records are omitted.
+
+    Fragments are concatenated in order, so a reply split across several
+    streaming events stays one conclusion. A literal `finding:` prefix is not
+    required.
+    """
+    parts: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "text":
+            continue
+        data = event.get("data")
+        if isinstance(data, str):
+            parts.append(data)
+    return "".join(parts).strip()
 
 
 def extract_findings(text: str) -> str:
@@ -90,6 +116,7 @@ def render_report(info: ReportInputs) -> str:
     else:
         fail_body = "Nothing failed."
     findings = info.findings.strip() or "(no provider findings were captured)"
+    conclusion = info.conclusion.strip() or "(no provider conclusion was captured)"
     commands = info.verification_commands or ["(none)"]
     verification_result = info.verification_output.strip() or "(no verification output)"
     if info.verification_exit_code is not None:
@@ -129,6 +156,7 @@ def render_report(info: ReportInputs) -> str:
             f"- Provider: {info.provider or '(none)'}",
             f"- Session: {info.session_id or '(none)'}",
             f"- Attempt: {info.attempt} of {info.max_attempts}",
+            f"- This report describes attempt {info.attempt}. Earlier attempt logs stay in the run directory.",
             f"- Recovery class: {recovery}",
             "",
             "## What succeeded",
@@ -139,6 +167,9 @@ def render_report(info: ReportInputs) -> str:
             "",
             "### Findings",
             findings,
+            "",
+            "## Provider conclusion",
+            conclusion,
             "",
             "## Repository",
             f"- Repository: {info.source_repo or '(unknown)'}",
@@ -160,6 +191,7 @@ def render_report(info: ReportInputs) -> str:
             "```",
             verification_result,
             "```",
+            "A verification exit of 0 means the declared check passed inside the isolated mutable workspace. It does not mean a model that can edit that workspace was unable to influence the check.",
             "",
             "## Measurements",
             *measurements,
@@ -185,6 +217,7 @@ def render_report(info: ReportInputs) -> str:
             f"- source integrity: {info.source_integrity or 'not-probed'}",
             f"- extension audit: {info.extension_audit or 'not-probed'}",
             f"- network containment: {info.network_containment or 'accepted limitation'}",
+            f"- inspect containment: {info.inspect_containment or 'not-probed'}",
             "",
             "## Inspect",
             "These commands are read-only.",

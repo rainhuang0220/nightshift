@@ -17,6 +17,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -286,8 +289,10 @@ def contained_run(
     env: dict[str, str],
     profile: Path,
     timeout: float,
+    poll_stop: Callable[[], str | None] | None = None,
+    on_pid: Callable[[int, int | None], None] | None = None,
 ) -> tuple[int, str]:
-    """Run argv under the profile. Timeout kills the child process group."""
+    """Run argv under the profile. Timeout or poll_stop kills the child group."""
     full = contained_argv(argv, profile)
     proc = subprocess.Popen(
         full,
@@ -299,9 +304,19 @@ def contained_run(
         start_new_session=True,
     )
     try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None
+    if on_pid is not None:
+        on_pid(proc.pid, pgid)
+    if poll_stop is not None:
+        watcher = threading.Thread(target=_stop_watcher, args=(proc, pgid, poll_stop), daemon=True)
+        watcher.start()
+    else:
+        watcher = None
+    try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        pgid = _pgid(proc.pid)
         terminate_process(proc.pid, pgid)
         try:
             stdout, stderr = proc.communicate(timeout=5)
@@ -309,9 +324,22 @@ def contained_run(
             stdout, stderr = "", ""
         output = scrub_text((stdout or "") + (stderr or "") + "verification timed out\n")
         return 124, output
+    finally:
+        if watcher is not None:
+            watcher.join(timeout=1)
     output = scrub_text((stdout or "") + (stderr or ""))
     code = proc.returncode if proc.returncode is not None else 1
+    if poll_stop is not None and poll_stop() and code not in {0}:
+        output += "cancelled\n"
     return code, output
+
+
+def _stop_watcher(proc: subprocess.Popen[str], pgid: int | None, poll_stop: Callable[[], str | None]) -> None:
+    while proc.poll() is None:
+        if poll_stop():
+            terminate_process(proc.pid, pgid)
+            return
+        time.sleep(0.05)
 
 
 def _ancestor_metadata_lines(roots: list[Path]) -> list[str]:

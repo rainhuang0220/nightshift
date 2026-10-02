@@ -206,7 +206,7 @@ class ReadContainmentTests(unittest.TestCase):
                 finally:
                     db.close()
                 self.assertEqual(finished.state, RunState.SUCCEEDED.value, finished.failure_reason)
-                profile = (config.runs_dir / finished.run_id / "provider.sb").read_text(encoding="utf-8")
+                profile = (config.runs_dir / finished.run_id / "attempt-1" / "provider.sb").read_text(encoding="utf-8")
                 self.assertNotIn(str(secret), profile)
                 self.assertFalse(profile_has_global_file_read(profile))
                 report = (config.runs_dir / finished.run_id / "report.md").read_text(encoding="utf-8")
@@ -471,11 +471,11 @@ class RuntimeProfileTests(unittest.TestCase):
                 finished = execute_run(config, db, locks, run.run_id)
             finally:
                 db.close()
-            log = (config.runs_dir / finished.run_id / "verification.log").read_text(encoding="utf-8")
+            log = (config.runs_dir / finished.run_id / "attempt-1" / "verification.log").read_text(encoding="utf-8")
             self.assertEqual(finished.state, RunState.SUCCEEDED.value, finished.failure_reason)
             self.assertRegex(log, r"(?m)^missing$")
             self.assertNotRegex(log, r"(?m)^present$")
-            self.assertFalse((config.runs_dir / finished.run_id / "grok-home" / "auth.json").exists())
+            self.assertFalse((config.runs_dir / finished.run_id / "attempt-1" / "grok-home" / "auth.json").exists())
             self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
 
     def test_contained_grok_home_symlink_does_not_change_the_auth_store(self) -> None:
@@ -641,7 +641,7 @@ class RuntimeProfileTests(unittest.TestCase):
             self.assertTrue((source / ".mcp.json").is_file())
             report = (config.runs_dir / finished.run_id / "report.md").read_text(encoding="utf-8")
             self.assertIn("(no file changes detected)", report)
-            self.assertFalse((config.runs_dir / finished.run_id / "grok-home" / "auth.json").exists())
+            self.assertFalse((config.runs_dir / finished.run_id / "attempt-1" / "grok-home" / "auth.json").exists())
 
     def _source(self, root: Path) -> Path:
         origin = root / "origin"

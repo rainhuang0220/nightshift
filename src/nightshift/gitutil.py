@@ -8,8 +8,10 @@ resets, cleans, or checks out the source working tree.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -22,15 +24,60 @@ class GitError(Exception):
         self.returncode = returncode
 
 
+def hook_config_args(anchor: Path) -> list[str]:
+    """Per-invocation Git config that disables hooks and templates."""
+    hooks = anchor / "hooks"
+    template = anchor / "template"
+    hooks.mkdir(parents=True, exist_ok=True)
+    template.mkdir(parents=True, exist_ok=True)
+    return [
+        "-c",
+        f"core.hooksPath={hooks}",
+        "-c",
+        f"init.templateDir={template}",
+    ]
+
+
+def sanitized_git_env(anchor: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for one Git invocation. The operator config is not modified."""
+    env = dict(os.environ if base is None else base)
+    for key in list(env):
+        if key in {
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_NAMESPACE",
+            "GIT_COMMON_DIR",
+        } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(key, None)
+    anchor.mkdir(parents=True, exist_ok=True)
+    empty = anchor / "gitconfig"
+    empty.write_text("", encoding="utf-8")
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = str(empty)
+    env["GIT_CONFIG_SYSTEM"] = str(empty)
+    env["GIT_CONFIG_COUNT"] = "0"
+    return env
+
+
 def run_git(
     repo: Path,
     args: list[str],
     *,
     check: bool = True,
     env: dict[str, str] | None = None,
+    config_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    command = [GIT_BIN, "-C", str(repo)]
+    if config_args:
+        command.extend(config_args)
+    command.extend(args)
     proc = subprocess.run(
-        [GIT_BIN, "-C", str(repo), *args],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -65,9 +112,20 @@ def current_branch(repo: Path) -> str:
 
 
 def add_detached_worktree(source: Path, dest: Path, revision: str) -> None:
-    """Register a detached worktree. This writes `.git/worktrees` metadata only."""
+    """Register a detached worktree. This writes `.git/worktrees` metadata only.
+
+    The checkout runs with hooks and templates disabled for this invocation.
+    The operator's global Git config is not edited.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    run_git(source, ["worktree", "add", "--detach", str(dest), revision])
+    with tempfile.TemporaryDirectory(prefix="nightshift-git-") as raw:
+        anchor = Path(raw)
+        run_git(
+            source,
+            ["worktree", "add", "--detach", str(dest), revision],
+            env=sanitized_git_env(anchor),
+            config_args=hook_config_args(anchor),
+        )
 
 
 def commits_since(repo: Path, revision: str) -> list[str]:

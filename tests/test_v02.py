@@ -23,7 +23,7 @@ from nightshift.probe import run_fake_probe, run_safety_probe
 from nightshift.providers.grok import build_grok_argv
 from nightshift.policy import build_policy, minimal_env
 from nightshift.queue import enqueue
-from nightshift.runner import _child_env, execute_run
+from nightshift.runner import _provider_env, execute_run
 from nightshift.runtime import auth_bootstrap, auth_status
 from nightshift.testkit import git, make_repo, write_job
 from nightshift.workspace import WorktreeWorkspaceBackend, inspect_source, prepare_workspace
@@ -107,7 +107,7 @@ class RuntimeTests(unittest.TestCase):
             root = Path(raw)
             config = load_config(root)
             config.ensure_dirs()
-            env = _child_env(config, root / "run", root / "workspace", root / "source", "ns-test")
+            env = _provider_env(config, root / "run", root / "workspace", root / "source", "ns-test")
             self.assertNotEqual(Path(env["HOME"]).resolve(), Path.home().resolve())
             self.assertEqual(Path(env["GROK_HOME"]).resolve(), (root / "run" / "grok-home").resolve())
             self.assertNotEqual(Path(env["GROK_HOME"]).resolve(), config.auth_store().resolve())
@@ -469,11 +469,19 @@ class ProbeTests(unittest.TestCase):
             sentinel = root / "sentinel.txt"
             sentinel.write_text("stay\n", encoding="utf-8")
             delta = SimpleNamespace(ok=True, changed_categories=())
-            failed = _real_gate(delta, [], [], True, sentinel, source, provider_exit_code=1)
-            ok = _real_gate(delta, [], [], True, sentinel, source, provider_exit_code=0)
+            failed = _real_gate(
+                delta, [], [], True, sentinel, source, provider_exit_code=1, run_state="SUCCEEDED"
+            )
+            unfinished = _real_gate(
+                delta, [], [], True, sentinel, source, provider_exit_code=0, run_state="FAILED"
+            )
+            ok = _real_gate(
+                delta, [], [], True, sentinel, source, provider_exit_code=0, run_state="SUCCEEDED"
+            )
         finally:
             shutil.rmtree(root, ignore_errors=True)
         self.assertEqual(failed, "FAIL")
+        self.assertEqual(unfinished, "FAIL")
         self.assertEqual(ok, "PASS_WITH_LIMITATIONS")
 
     def test_real_probe_uses_the_launch_audit_not_the_restored_clone(self) -> None:
@@ -529,8 +537,10 @@ class LogTests(unittest.TestCase):
             self.assertTrue(compare(before, capture(source)).ok)
             run_dir = Path(finished.run_dir)
             self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o700)
-            for name in ("provider.stdout.log", "provider.stderr.log", "verification.log", "report.md"):
-                self.assertEqual(stat.S_IMODE((run_dir / name).stat().st_mode) & 0o077, 0)
+            attempt = run_dir / "attempt-1"
+            for name in ("provider.stdout.log", "provider.stderr.log", "verification.log"):
+                self.assertEqual(stat.S_IMODE((attempt / name).stat().st_mode) & 0o077, 0)
+            self.assertEqual(stat.S_IMODE((run_dir / "report.md").stat().st_mode) & 0o077, 0)
             self.assertIn("nightshift: record fake provider note", (run_dir / "report.md").read_text(encoding="utf-8"))
             report = (run_dir / "report.md").read_text(encoding="utf-8")
             self.assertIn("does not merge or push", report)

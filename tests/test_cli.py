@@ -80,16 +80,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual((source / "DIRTY.txt").read_text(encoding="utf-8"), "dirty\n")
             run_id = result.stdout.split()[1]
             run_dir = state / "runs" / run_id
+            for name in ("metadata.json", "events.jsonl", "report.md"):
+                self.assertTrue((run_dir / name).is_file(), name)
+            attempt = run_dir / "attempt-1"
             for name in (
-                "metadata.json",
                 "prompt.final.md",
                 "provider.stdout.log",
                 "provider.stderr.log",
-                "events.jsonl",
                 "verification.log",
-                "report.md",
             ):
-                self.assertTrue((run_dir / name).is_file(), name)
+                self.assertTrue((attempt / name).is_file(), name)
             report = (run_dir / "report.md").read_text(encoding="utf-8")
             self.assertIn(str(source), report)
             self.assertIn(head, report)

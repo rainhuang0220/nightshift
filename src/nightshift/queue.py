@@ -41,48 +41,48 @@ def enqueue(db: Database, job_path: Path, *, provider: str | None = None) -> Run
 def claim_next(db: Database) -> RunRecord | None:
     """Claim the oldest queued run whose group and repository are free.
 
-    The conditional update is the claim token. This does not launch a provider.
+    The conditional update and the lock insert share one immediate transaction.
+    This does not launch a provider.
     """
-    with db.transaction():
-        for run_id in _queued_ids_locked(db):
-            run = db._fetch(run_id)
-            if run is None or run.state != RunState.QUEUED.value:
-                continue
-            if _blocked_by_lock(db, run):
-                continue
-            now = utc_now()
-            cursor = db._conn.execute(
-                """
-                UPDATE runs
-                   SET state = ?, updated_at = ?
-                 WHERE run_id = ? AND state = ?
-                """,
-                (RunState.PREPARING.value, now, run.run_id, RunState.QUEUED.value),
-            )
-            if cursor.rowcount != 1:
-                continue
-            now_lock = utc_now()
-            for key in _lock_keys(run):
-                db._conn.execute(
+    from nightshift.db import _LockDenied, _acquire_locks_conn
+
+    try:
+        with db.transaction():
+            for run_id in _queued_ids_locked(db):
+                run = db._fetch(run_id)
+                if run is None or run.state != RunState.QUEUED.value:
+                    continue
+                keys = _lock_keys(run)
+                if not _locks_available(db, keys, run.run_id):
+                    continue
+                now = utc_now()
+                cursor = db._conn.execute(
                     """
-                    INSERT INTO locks (lock_key, run_id, acquired_at, pid)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(lock_key) DO UPDATE SET
-                        run_id = excluded.run_id,
-                        acquired_at = excluded.acquired_at,
-                        pid = excluded.pid
+                    UPDATE runs
+                       SET state = ?, updated_at = ?
+                     WHERE run_id = ? AND state = ?
                     """,
-                    (key, run.run_id, now_lock, os.getpid()),
+                    (RunState.PREPARING.value, now, run.run_id, RunState.QUEUED.value),
                 )
-            db._insert_event(
-                db._conn,
-                run.run_id,
-                "state",
-                RunState.PREPARING.value,
-                "claimed",
-            )
-            claimed = db._fetch(run.run_id)
-            return claimed
+                if cursor.rowcount != 1:
+                    continue
+                if keys and not _acquire_locks_conn(db._conn, keys, run.run_id, os.getpid()):
+                    db._conn.execute(
+                        "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ? AND state = ?",
+                        (RunState.QUEUED.value, utc_now(), run.run_id, RunState.PREPARING.value),
+                    )
+                    continue
+                db._insert_event(
+                    db._conn,
+                    run.run_id,
+                    "state",
+                    RunState.PREPARING.value,
+                    "claimed",
+                )
+                claimed = db._fetch(run.run_id)
+                return claimed
+    except _LockDenied:
+        return None
     return None
 
 
@@ -101,10 +101,10 @@ def _lock_keys(run: RunRecord) -> list[str]:
     return keys
 
 
-def _blocked_by_lock(db: Database, run: RunRecord) -> bool:
-    keys = _lock_keys(run)
+def _locks_available(db: Database, keys: list[str], run_id: str) -> bool:
+    """Read-only classification. Stale rows are removed later by the shared acquire."""
     if not keys:
-        return False
+        return True
     from nightshift.locks import pid_alive
     from nightshift.models import TERMINAL_STATES
 
@@ -115,12 +115,11 @@ def _blocked_by_lock(db: Database, run: RunRecord) -> bool:
     ).fetchall()
     terminal_values = {state.value for state in TERMINAL_STATES}
     for row in rows:
-        if row["run_id"] == run.run_id:
+        if row["run_id"] == run_id:
             continue
         holder = db._fetch(row["run_id"])
         stale = holder is None or holder.state in terminal_values or not pid_alive(row["pid"])
         if stale:
-            db._conn.execute("DELETE FROM locks WHERE lock_key = ?", (row["lock_key"],))
             continue
-        return True
-    return False
+        return False
+    return True

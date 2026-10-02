@@ -6,6 +6,7 @@ unless the operator passes `--retry`. Retry stops at max_attempts.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -13,10 +14,11 @@ from pathlib import Path
 
 from nightshift.config import Config
 from nightshift.db import Database
-from nightshift.locks import LockManager, process_matches
+from nightshift.locks import LockManager, phase_process_alive, process_matches
 from nightshift.models import (
     RETRYABLE_STATES,
     TERMINAL_STATES,
+    IllegalTransition,
     NightshiftError,
     RunRecord,
     RunState,
@@ -99,6 +101,14 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
             False,
         )
     if run.state == RunState.VERIFYING.value:
+        if probe.alive:
+            return RecoveryDecision(
+                "verification_still_alive",
+                "leave",
+                None,
+                "verification process still alive",
+                False,
+            )
         if not run.verification_ran:
             return RecoveryDecision(
                 "verification_never_ran",
@@ -122,10 +132,15 @@ def _scrub_recovered_auth(config: Config, run: RunRecord) -> None:
 
 
 def probe_run(run: RunRecord) -> ProcessProbe:
-    token = ""
-    if isinstance(run.process_meta, dict):
-        token = str(run.process_meta.get("match") or "")
-    alive = process_matches(run.pid, token) if run.pid else False
+    """Alive means the recorded phase process is still the same process.
+
+    PREPARING, verification, and inspect match the pid and its start time.
+    The provider also requires its session id on the command line. A recycled
+    pid with a different start time is not alive. Rows written before phase
+    metadata existed still use pid plus token.
+    """
+    meta = run.process_meta if isinstance(run.process_meta, dict) else {}
+    alive = phase_process_alive(meta, fallback_pid=run.pid)
     exists = bool(run.workspace_path) and Path(run.workspace_path).is_dir()
     return ProcessProbe(alive=alive, workspace_exists=exists)
 
@@ -207,12 +222,17 @@ def retry_run(db: Database, run_id: str) -> RunRecord:
         attempt=run.attempt + 1,
         failure_reason="",
         ended_at="",
+        started_at="",
+        session_id="",
         pid=None,
+        process_meta={},
         exit_code=None,
         provider_exit_code=None,
         verification_exit_code=None,
         verification_ran=False,
         recovery_class="",
+        invocation={},
+        provider_argv=[],
     )
 
 
@@ -222,33 +242,65 @@ def cancel_run(config: Config, db: Database, locks: LockManager, run_id: str) ->
         return run
     if run.state in TERMINAL_VALUES:
         raise NightshiftError(f"cannot cancel terminal run in state {run.state}")
-    token = str((run.process_meta or {}).get("match") or "")
-    pgid = None
-    if isinstance(run.process_meta, dict):
-        raw = run.process_meta.get("pgid")
-        pgid = int(raw) if isinstance(raw, int) else None
-    if run.pid and process_matches(run.pid, token):
-        terminate_process(run.pid, pgid)
-    _scrub_recovered_auth(config, run)
-    if run.state == RunState.QUEUED.value:
-        db.transition(run_id, RunState.CANCELLED.value, "cancelled", failure_reason="cancelled")
-    elif run.state in {RunState.PREPARING.value, RunState.RUNNING.value, RunState.VERIFYING.value}:
-        current = db.require_run(run_id)
-        if current.state not in TERMINAL_VALUES:
-            db.transition(
-                run_id,
-                RunState.CANCELLED.value,
-                "cancelled",
-                failure_reason="cancelled",
-                ended_at=utc_now(),
-                exit_code=exit_code_for_state(RunState.CANCELLED.value),
-            )
-    locks.release(run_id)
-    if run.run_dir or (config.runs_dir / run_id).exists():
-        if not run.run_dir:
+    # Record CANCELLED before signalling. The worker observes the dead child
+    # and would otherwise settle FAILED or SUCCEEDED while this function is
+    # still inside terminate_process.
+    cancelled = _record_cancellation(db, run_id)
+    if cancelled.state != RunState.CANCELLED.value:
+        return cancelled
+    _signal_cancelled_child(cancelled)
+    _scrub_recovered_auth(config, cancelled)
+    if not probe_run(db.require_run(run_id)).alive:
+        locks.release(run_id)
+    if cancelled.run_dir or (config.runs_dir / run_id).exists():
+        if not cancelled.run_dir:
             db.update_run(run_id, run_dir=str(config.runs_dir / run_id))
         publish_report(config, db, run_id, extra_uncertainty=["Cancelled by operator."])
     return db.require_run(run_id)
+
+
+def _record_cancellation(db: Database, run_id: str) -> RunRecord:
+    """Move a live run to CANCELLED, or return the terminal row if it already finished."""
+    cancellable = {
+        RunState.QUEUED.value,
+        RunState.PREPARING.value,
+        RunState.RUNNING.value,
+        RunState.VERIFYING.value,
+    }
+    for _ in range(3):
+        current = db.require_run(run_id)
+        if current.state == RunState.CANCELLED.value or current.state not in cancellable:
+            return current
+        fields: dict[str, object] = {"failure_reason": "cancelled"}
+        if current.state != RunState.QUEUED.value:
+            fields["ended_at"] = utc_now()
+            fields["exit_code"] = exit_code_for_state(RunState.CANCELLED.value)
+        try:
+            return db.transition(run_id, RunState.CANCELLED.value, "cancelled", **fields)
+        except IllegalTransition:
+            continue
+    return db.require_run(run_id)
+
+
+def _signal_cancelled_child(run: RunRecord) -> None:
+    """Terminate the provider, inspect, or verification child. Never the preparing controller."""
+    meta = run.process_meta if isinstance(run.process_meta, dict) else {}
+    phase = str(meta.get("phase") or "")
+    if phase == "preparing":
+        return
+    token = str(meta.get("match") or "")
+    raw_pgid = meta.get("pgid")
+    pgid = int(raw_pgid) if isinstance(raw_pgid, int) else None
+    raw_pid = meta.get("pid") if meta.get("pid") is not None else run.pid
+    try:
+        pid = int(raw_pid) if raw_pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    child_alive = probe_run(run).alive and pid is not None and pid != os.getpid()
+    if not child_alive:
+        return
+    if phase in {"provider", "verifying", "inspect"} or process_matches(pid, token):
+        terminate_process(pid, pgid)
 
 
 def serve(config: Config, db: Database, locks: LockManager, stop: threading.Event) -> int:

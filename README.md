@@ -144,6 +144,10 @@ Nightshift relies on these layers, in this order:
 
 The provider needs network connectivity to reach the model API. Arbitrary external network mutation, including an https or ssh `git push`, is not currently an operating-system hard block. Verification runs with network denied. A push to a local path outside the writable roots is a filesystem hard block.
 
+A verification exit of 0 means the declared check passed inside the isolated mutable workspace. It does not mean a model that can edit that workspace was unable to influence the check. Source integrity, filesystem containment, credential isolation, and human review remain the security boundaries.
+
+Provider writes are the workspace, when the job allows it, and that attempt's private runtime directories. Nightshift control files, profiles, shims, and the verification runtime are not writable by the provider. Trusted log and report writes do not follow symlinks.
+
 Grok's own `--sandbox` flag is not passed. Nested sandbox setup fails inside the seatbelt, and Grok then refuses to start.
 
 Redaction of logs is best-effort. It is not a guarantee over arbitrary repository content.

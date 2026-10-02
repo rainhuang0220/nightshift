@@ -172,6 +172,15 @@ def _print_runs(runs) -> int:
     return EXIT_OK
 
 
+def _attempt_log(run_dir: Path | None, attempt: int, name: str) -> Path:
+    if run_dir is None:
+        return Path(name)
+    current = run_dir / f"attempt-{attempt if attempt > 0 else 1}" / name
+    if current.is_file():
+        return current
+    return run_dir / name
+
+
 def _logs(db: Database, run_id: str) -> int:
     run = db.require_run(run_id)
     print(f"run {run.run_id} {run.state}")
@@ -180,9 +189,9 @@ def _logs(db: Database, run_id: str) -> int:
         print(f"{event['ts']} {event['kind']} {event['state'] or '-'} {scrub_text(event['message'])}")
     run_dir = Path(run.run_dir) if run.run_dir else None
     print("--- stdout")
-    print(_tail(run_dir / "provider.stdout.log") if run_dir else "(no run directory)")
+    print(_tail(_attempt_log(run_dir, run.attempt, "provider.stdout.log")) if run_dir else "(no run directory)")
     print("--- stderr")
-    print(_tail(run_dir / "provider.stderr.log") if run_dir else "(no run directory)")
+    print(_tail(_attempt_log(run_dir, run.attempt, "provider.stderr.log")) if run_dir else "(no run directory)")
     return EXIT_OK
 
 

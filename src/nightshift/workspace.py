@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,11 +26,13 @@ from nightshift.gitutil import (
     GIT_BIN,
     add_detached_worktree,
     current_branch,
+    hook_config_args,
     inside,
     is_git_repo,
     porcelain,
     rev_parse,
     run_git,
+    sanitized_git_env,
 )
 
 
@@ -128,20 +131,25 @@ class CloneWorkspaceBackend(WorkspaceBackend):
     def prepare(self, snapshot: SourceSnapshot, dest: Path) -> Path:
         dest = _fresh_dest(snapshot, dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            [GIT_BIN, "clone", "--no-hardlinks", "--no-checkout", str(snapshot.repo), str(dest)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            raise WorkspaceError(f"git clone failed: {detail}")
-        run_git(dest, ["remote", "remove", "origin"], check=False)
-        try:
-            run_git(dest, ["checkout", "--detach", snapshot.revision])
-        except Exception as exc:
-            raise WorkspaceError(str(exc)) from exc
+        with tempfile.TemporaryDirectory(prefix="nightshift-git-") as raw:
+            anchor = Path(raw)
+            env = sanitized_git_env(anchor)
+            config_args = hook_config_args(anchor)
+            proc = subprocess.run(
+                [GIT_BIN, *config_args, "clone", "--no-hardlinks", "--no-checkout", str(snapshot.repo), str(dest)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                raise WorkspaceError(f"git clone failed: {detail}")
+            run_git(dest, ["remote", "remove", "origin"], check=False, env=env, config_args=config_args)
+            try:
+                run_git(dest, ["checkout", "--detach", snapshot.revision], env=env, config_args=config_args)
+            except Exception as exc:
+                raise WorkspaceError(str(exc)) from exc
         hooks = dest / ".git" / "nightshift-hooks"
         hooks.mkdir(parents=True, exist_ok=True)
         run_git(dest, ["config", "--local", "core.hooksPath", str(hooks)])

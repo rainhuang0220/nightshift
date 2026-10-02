@@ -10,7 +10,6 @@ import os
 import subprocess
 
 from nightshift.db import Database
-from nightshift.models import TERMINAL_STATES
 
 GROUP_PREFIX = "group:"
 REPO_PREFIX = "repo:"
@@ -41,6 +40,31 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def process_start_token(pid: int | None) -> str:
+    """Process start time, used so a recycled pid does not match an old phase."""
+    if pid is None or pid <= 0:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def process_identity_matches(pid: int | None, identity: str | None) -> bool:
+    """True when `pid` is alive and its start time is still `identity`."""
+    if not identity or not pid_alive(pid):
+        return False
+    return process_start_token(pid) == identity
+
+
 def process_matches(pid: int | None, token: str | None) -> bool:
     """True only when `pid` is alive and its command line contains `token`.
 
@@ -65,6 +89,33 @@ def process_matches(pid: int | None, token: str | None) -> bool:
     return token in proc.stdout
 
 
+def phase_process_alive(meta: dict, *, fallback_pid: int | None = None) -> bool:
+    """Whether the recorded phase process is still that same process.
+
+    PREPARING, verification, and inspect use the pid plus its start time.
+    The provider also requires the session id Nightshift put on its argv.
+    An empty phase keeps the older pid-plus-token check.
+    """
+    phase = str(meta.get("phase") or "")
+    token = str(meta.get("match") or "")
+    identity = str(meta.get("identity") or "")
+    raw_pid = meta.get("pid") if meta.get("pid") is not None else fallback_pid
+    try:
+        pid = int(raw_pid) if raw_pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    if phase == "preparing":
+        return process_identity_matches(pid, identity)
+    if phase == "provider":
+        alive = process_matches(pid, token)
+        if alive and identity:
+            return process_identity_matches(pid, identity)
+        return alive
+    if phase in {"verifying", "inspect"}:
+        return process_identity_matches(pid, identity)
+    return process_matches(fallback_pid, token) if fallback_pid else False
+
+
 class LockManager:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -72,30 +123,7 @@ class LockManager:
     def acquire(self, keys: list[str], run_id: str, pid: int | None = None) -> bool:
         owner = pid if pid is not None else os.getpid()
         unique = list(dict.fromkeys(keys))
-        for key in unique:
-            if not self._clear_if_stale(key, run_id):
-                return False
-        self.db.write_locks(unique, run_id, owner)
-        # Confirm we still own every key. A concurrent acquire can win the write.
-        held = set(self.db.locks_held_by_others(unique, run_id))
-        if held:
-            self.db.release_locks(run_id)
-            return False
-        return True
+        return self.db.try_acquire_locks(unique, run_id, owner)
 
     def release(self, run_id: str) -> None:
         self.db.release_locks(run_id)
-
-    def _clear_if_stale(self, key: str, run_id: str) -> bool:
-        rows = [row for row in self.db.lock_rows() if row["lock_key"] == key]
-        if not rows:
-            return True
-        row = rows[0]
-        if row["run_id"] == run_id:
-            return True
-        holder = self.db.get_run(row["run_id"])
-        terminal = holder is None or holder.state in {state.value for state in TERMINAL_STATES}
-        if terminal or not pid_alive(row["pid"]):
-            self.db.delete_lock(key)
-            return True
-        return False

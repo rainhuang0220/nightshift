@@ -33,7 +33,14 @@ from nightshift.gitutil import (
 from nightshift.guard import write_shims
 from nightshift.integrity import capture, compare, dumps
 from nightshift.job import Job, resolved_repository, verification_plan
-from nightshift.locks import LockManager, group_key, repo_key, workspace_key
+from nightshift.locks import (
+    LockManager,
+    group_key,
+    phase_process_alive,
+    process_start_token,
+    repo_key,
+    workspace_key,
+)
 from nightshift.models import (
     TERMINAL_STATES,
     Job as JobModel,
@@ -46,9 +53,17 @@ from nightshift.policy import build_policy, minimal_env, scrub_text
 from nightshift.priv import ensure_private_dir, write_private_text
 from nightshift.providers import get_provider
 from nightshift.providers.base import ProviderRequest
-from nightshift.report import ReportInputs, extract_findings, extract_metrics, render_report, summarize_stream
+from nightshift.report import (
+    ReportInputs,
+    extract_findings,
+    extract_metrics,
+    provider_conclusion,
+    render_report,
+    summarize_stream,
+)
 from nightshift.runtime import (
     apply_runtime_env,
+    attempt_dir,
     prepare_run_grok_home,
     prepare_runtime_dirs,
     scrub_per_run_auth,
@@ -59,12 +74,14 @@ from nightshift.workspace import WorkspaceError, cleanup_workspace, import_instr
 TERMINAL_VALUES = {state.value for state in TERMINAL_STATES}
 REQUIRED_FILES = (
     "metadata.json",
+    "events.jsonl",
+    "report.md",
+)
+ATTEMPT_FILES = (
     "prompt.final.md",
     "provider.stdout.log",
     "provider.stderr.log",
-    "events.jsonl",
     "verification.log",
-    "report.md",
 )
 SUSPICIOUS = (
     "git push",
@@ -83,6 +100,10 @@ class RunFailed(Exception):
     pass
 
 
+class RunCancelled(Exception):
+    pass
+
+
 def execute_run(
     config: Config,
     db: Database,
@@ -97,9 +118,12 @@ def execute_run(
         raise RunFailed(f"run {run_id} is {run.state}, not runnable")
     if not run.started_at:
         run = db.update_run(run_id, started_at=utc_now())
+    _mark_phase(db, run_id, "preparing", os.getpid(), match=run_id)
     job = _job_from_run(run)
     run_dir = config.runs_dir / run_id
     _ensure_run_files(run_dir)
+    current_attempt = attempt_dir(run_dir, run.attempt)
+    _ensure_attempt_files(current_attempt)
     host = _host_info()
     run = db.update_run(run_id, run_dir=str(run_dir), host_info=host, report_path=str(run_dir / "report.md"))
     _emit(db, run_dir, run_id, "prepare", "run directory ready", RunState.PREPARING.value)
@@ -152,18 +176,55 @@ def execute_run(
             )
         if not sandbox_available():
             raise RunBlocked("sandbox-exec is not available; refusing to run unsandboxed")
-        prompt_path = run_dir / "prompt.final.md"
+        prompt_path = current_attempt / "prompt.final.md"
         write_private_text(prompt_path, policy.preamble + job.prompt.rstrip() + "\n")
         session_id = run.session_id or _new_session()
-        env = _child_env(config, run_dir, dest, repo, run_id)
+        env = _provider_env(config, current_attempt, dest, repo, run_id)
+
+        def poll_stop() -> str | None:
+            if stop_event is not None and stop_event.is_set():
+                return "interrupt"
+            current_stop = db.get_run(run_id)
+            if current_stop is not None and current_stop.state == RunState.CANCELLED.value:
+                return "cancel"
+            return None
+
+        def on_inspect_pid(pid: int, pgid: int | None) -> None:
+            _mark_phase(db, run_id, "inspect", pid, pgid=pgid, match="grok")
+
+        _checkpoint_cancel(db, run_id)
         audit_record = {"ok": True, "violations": [], "counts": {}, "untrusted_instructions": len(instructions)}
+        inspect_containment = "not-run"
         if job.provider == "grok" and os.environ.get("NIGHTSHIFT_FORBID_GROK") != "1":
-            audit = run_inspect(env, dest)
+            preflight = _preflight_profile(config, current_attempt, dest, repo)
+            audit = run_inspect(
+                env,
+                dest,
+                profile=preflight,
+                timeout=60,
+                poll_stop=poll_stop,
+                on_pid=on_inspect_pid,
+            )
+            _mark_phase(db, run_id, "preparing", os.getpid(), match=run_id)
+            if audit.ok:
+                inspect_containment = "seatbelt"
+            else:
+                inspect_containment = "outside-seatbelt"
+                audit = run_inspect(
+                    env,
+                    dest,
+                    timeout=60,
+                    poll_stop=poll_stop,
+                    on_pid=on_inspect_pid,
+                )
+                _mark_phase(db, run_id, "preparing", os.getpid(), match=run_id)
             audit_record = audit.to_dict()
+            _checkpoint_cancel(db, run_id)
             if not audit.ok:
                 raise RunBlocked(BLOCKED_EXTENSION_SURFACE + ": " + ", ".join(audit.violations))
         elif job.provider == "grok":
             raise RunBlocked("refusing to launch grok because NIGHTSHIFT_FORBID_GROK=1")
+        _checkpoint_cancel(db, run_id)
         invocation = _invocation(
             job,
             policy,
@@ -174,13 +235,16 @@ def execute_run(
             audit=audit_record,
             instructions=instructions,
         )
+        invocation["inspect_containment"] = inspect_containment
+        invocation["attempt_dir"] = str(current_attempt)
         db.update_run(run_id, invocation=invocation)
         profile = _provider_profile(
             config,
-            run_dir,
+            current_attempt,
             dest,
             source=repo,
             network=job.provider == "grok",
+            write_scope=job.write_scope,
         )
         boundary = _read_boundary(profile, dest, env, repo)
         invocation["trust_boundary"] = boundary
@@ -200,8 +264,8 @@ def execute_run(
             run_id=run_id,
             workspace=dest,
             prompt_path=prompt_path,
-            stdout_path=run_dir / "provider.stdout.log",
-            stderr_path=run_dir / "provider.stderr.log",
+            stdout_path=current_attempt / "provider.stdout.log",
+            stderr_path=current_attempt / "provider.stderr.log",
             env=env,
             timeout=float(job.max_runtime_seconds),
             write_scope=job.write_scope,
@@ -215,17 +279,8 @@ def execute_run(
             db.update_run(run_id, provider_argv=argv)
 
         def on_pid(pid: int, pgid: int | None) -> None:
-            meta = {"pid": pid, "pgid": pgid, "match": session_id}
-            db.update_run(run_id, pid=pid, process_meta=meta)
+            _mark_phase(db, run_id, "provider", pid, pgid=pgid, match=session_id)
             _emit(db, run_dir, run_id, "process", f"pid {pid}", RunState.RUNNING.value)
-
-        def poll_stop() -> str | None:
-            if stop_event is not None and stop_event.is_set():
-                return "interrupt"
-            current = db.get_run(run_id)
-            if current is not None and current.state == RunState.CANCELLED.value:
-                return "cancel"
-            return None
 
         result = provider.execute(
             request,
@@ -238,9 +293,9 @@ def execute_run(
         # Put those entries back before verification and the report, so a
         # read-only job does not keep clone deletions.
         restore_neutralized_extensions(dest, run_dir)
-        # Verification executes repository code and can read the run directory.
-        # Drop the auth copy before that child starts. The finally block scrubs
-        # again on cancel, interrupt, and failure.
+        # Drop the auth copy before verification. That child gets a fresh
+        # runtime and can still execute code in the mutable workspace.
+        # The finally block scrubs again on cancel, interrupt, and failure.
         scrub_per_run_auth(run_dir)
         current = db.require_run(run_id)
         if current.state == RunState.CANCELLED.value:
@@ -265,16 +320,28 @@ def execute_run(
             provider_exit_code=result.exit_code,
             pid=result.pid if result.pid is not None else current.pid,
         )
+        _checkpoint_cancel(db, run_id)
+        verify_env = _verification_env(config, current_attempt, dest, repo, run_id)
         db.transition(run_id, RunState.VERIFYING.value, "verifying")
+
+        def on_verify_pid(pid: int, pgid: int | None) -> None:
+            _mark_phase(db, run_id, "verifying", pid, pgid=pgid, match=run_id)
+
         ver_code, ver_text = run_verification(
             steps,
             cwd=dest,
-            env=env,
-            log_path=run_dir / "verification.log",
+            env=verify_env,
+            log_path=current_attempt / "verification.log",
             timeout=float(job.max_runtime_seconds),
-            profile=_verification_profile(config, run_dir, dest, repo),
+            profile=_verification_profile(config, current_attempt, dest, repo),
+            poll_stop=poll_stop,
+            on_pid=on_verify_pid,
         )
         del ver_text
+        if db.require_run(run_id).state == RunState.CANCELLED.value:
+            _finish_times(db, run_id, exit_code=exit_code_for_state(RunState.CANCELLED.value))
+            publish_report(config, db, run_id)
+            return db.require_run(run_id)
         db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
         try:
             db.update_run(run_id, source_porcelain_after=porcelain(repo))
@@ -296,29 +363,47 @@ def execute_run(
             uncertainty.append(integrity.detail + "; Nightshift did not restore the source")
         if result.failure_reason and result.failure_reason not in decision.reason:
             uncertainty.append(result.failure_reason)
+        if db.require_run(run_id).state == RunState.CANCELLED.value:
+            _finish_times(db, run_id, exit_code=exit_code_for_state(RunState.CANCELLED.value))
+            publish_report(config, db, run_id, extra_uncertainty=uncertainty)
+            return db.require_run(run_id)
         ended = utc_now()
         started = current.started_at
-        db.transition(
-            run_id,
-            decision.state,
-            decision.reason or "finished",
-            failure_reason=decision.reason,
-            exit_code=exit_code_for_state(decision.state),
-            ended_at=ended,
-            duration_seconds=_duration(started, ended),
-        )
+        try:
+            db.transition(
+                run_id,
+                decision.state,
+                decision.reason or "finished",
+                failure_reason=decision.reason,
+                exit_code=exit_code_for_state(decision.state),
+                ended_at=ended,
+                duration_seconds=_duration(started, ended),
+            )
+        except Exception:
+            latest = db.require_run(run_id)
+            if latest.state != RunState.CANCELLED.value:
+                raise
+            publish_report(config, db, run_id, extra_uncertainty=uncertainty)
+            return latest
         publish_report(config, db, run_id, extra_uncertainty=uncertainty)
         _maybe_remove_worktree(config, repo, dest, decision.state, job.isolation or "clone")
         return db.require_run(run_id)
-    except RunBlocked as exc:
-        _settle(db, run_id, RunState.BLOCKED.value, str(exc))
-        publish_report(config, db, run_id, extra_uncertainty=[str(exc)])
-        return db.require_run(run_id)
-    except (RunFailed, WorkspaceError, OSError) as exc:
-        _settle(db, run_id, RunState.FAILED.value, str(exc))
-        publish_report(config, db, run_id, extra_uncertainty=[str(exc)])
+    except RunCancelled:
+        publish_report(config, db, run_id, extra_uncertainty=["Cancelled by operator."])
         return db.require_run(run_id)
     except Exception as exc:
+        current = db.get_run(run_id)
+        if current is not None and current.state == RunState.CANCELLED.value:
+            publish_report(config, db, run_id, extra_uncertainty=["Cancelled by operator."])
+            return current
+        if isinstance(exc, RunBlocked):
+            _settle(db, run_id, RunState.BLOCKED.value, str(exc))
+            publish_report(config, db, run_id, extra_uncertainty=[str(exc)])
+            return db.require_run(run_id)
+        if isinstance(exc, (RunFailed, WorkspaceError, OSError)):
+            _settle(db, run_id, RunState.FAILED.value, str(exc))
+            publish_report(config, db, run_id, extra_uncertainty=[str(exc)])
+            return db.require_run(run_id)
         try:
             _settle(db, run_id, RunState.FAILED.value, f"internal error: {exc}")
             publish_report(config, db, run_id, extra_uncertainty=[f"internal error: {exc}"])
@@ -332,7 +417,8 @@ def execute_run(
             scrub_per_run_auth(run_dir)
         except Exception:
             pass
-        locks.release(run_id)
+        if not _foreign_phase_alive(db, run_id):
+            locks.release(run_id)
 
 
 def run_verification_only(config: Config, db: Database, run_id: str) -> RunRecord:
@@ -369,7 +455,9 @@ def _run_verification_only(
     if run.state == RunState.RUNNING.value:
         db.transition(run_id, RunState.VERIFYING.value, "recover: verification never ran")
     source = Path(run.source_repo) if run.source_repo else workspace
-    env = _child_env(config, run_dir, workspace, source, run_id, copy_auth=False)
+    current_attempt = attempt_dir(run_dir, run.attempt)
+    _ensure_attempt_files(current_attempt)
+    env = _verification_env(config, current_attempt, workspace, source, run_id)
     if not sandbox_available():
         _settle(db, run_id, RunState.FAILED.value, "sandbox-exec is not available; refusing to run unsandboxed")
         publish_report(config, db, run_id)
@@ -378,9 +466,9 @@ def _run_verification_only(
         verification_plan(job),
         cwd=workspace,
         env=env,
-        log_path=run_dir / "verification.log",
+        log_path=current_attempt / "verification.log",
         timeout=float(job.max_runtime_seconds or run.max_runtime_seconds or 600),
-        profile=_verification_profile(config, run_dir, workspace, source),
+        profile=_verification_profile(config, current_attempt, workspace, source),
     )
     db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
     current = db.require_run(run_id)
@@ -420,15 +508,16 @@ def publish_report(
 ) -> RunRecord:
     del config
     run = db.require_run(run_id)
-    job = _job_from_run(run)
     run_dir = Path(run.run_dir) if run.run_dir else None
     if run_dir is None:
         return run
+    job = _job_from_run(run)
     _ensure_run_files(run_dir)
-    stdout = _read(run_dir / "provider.stdout.log")
-    stderr = _read(run_dir / "provider.stderr.log")
+    stdout = _read(_resolve_run_file(run_dir, run.attempt, "provider.stdout.log"))
+    stderr = _read(_resolve_run_file(run_dir, run.attempt, "provider.stderr.log"))
+    conclusion = provider_conclusion(stdout)
     summary = summarize_stream(stdout)
-    findings = extract_findings(summary or stdout)
+    findings = extract_findings(conclusion or summary or stdout)
     if run.state != RunState.SUCCEEDED.value and stderr.strip():
         uncertainty_note = "Provider stderr was captured in the private log and omitted from this report."
     else:
@@ -485,7 +574,7 @@ def publish_report(
         commits=commits,
         files_changed=files,
         verification_commands=list(job.verification),
-        verification_output=_read(run_dir / "verification.log"),
+        verification_output=_read(_resolve_run_file(run_dir, run.attempt, "verification.log")),
         success_criteria=list(job.success_criteria),
         measurements=extract_metrics(stdout),
         host_info={str(k): str(v) for k, v in (run.host_info or {}).items()},
@@ -502,6 +591,8 @@ def publish_report(
         source_integrity=_source_integrity_label(run),
         extension_audit=_extension_audit_label(run),
         network_containment=str(boundary.get("network_containment") or "accepted limitation"),
+        inspect_containment=str((run.invocation or {}).get("inspect_containment") or "not-probed"),
+        conclusion=conclusion,
     )
     text = render_report(info)
     report_path = run_dir / "report.md"
@@ -520,6 +611,8 @@ def run_verification(
     log_path: Path,
     timeout: float,
     profile: Path | None = None,
+    poll_stop=None,
+    on_pid=None,
 ) -> tuple[int, str]:
     """Run structured argv steps inside the workspace seatbelt.
 
@@ -546,6 +639,8 @@ def run_verification(
             env=env,
             profile=profile,
             timeout=step_timeout,
+            poll_stop=poll_stop,
+            on_pid=on_pid,
         )
         block = f"$ {display}\n# {label}\n{output}exit {code}\n"
         parts.append(block)
@@ -608,8 +703,78 @@ def _ensure_run_files(run_dir: Path) -> None:
     ensure_private_dir(run_dir)
     for name in REQUIRED_FILES:
         path = run_dir / name
+        if path.is_symlink():
+            raise RunFailed(f"refusing to follow a non-regular control file: {name}")
         if not path.exists():
             write_private_text(path, "{}\n" if name == "metadata.json" else "")
+
+
+def _ensure_attempt_files(path: Path) -> None:
+    ensure_private_dir(path)
+    for name in ATTEMPT_FILES:
+        target = path / name
+        if target.is_symlink():
+            raise RunFailed(f"refusing to follow a non-regular control file: {name}")
+        if not target.exists():
+            write_private_text(target, "")
+
+
+def _resolve_run_file(run_dir: Path, attempt: int, name: str) -> Path:
+    current = attempt_dir(run_dir, attempt) / name
+    if current.exists():
+        return current
+    legacy = run_dir / name
+    if legacy.exists():
+        return legacy
+    return current
+
+
+def _mark_phase(
+    db: Database,
+    run_id: str,
+    phase: str,
+    pid: int,
+    *,
+    pgid: int | None = None,
+    match: str = "",
+) -> None:
+    identity = process_start_token(pid)
+    db.heartbeat(run_id)
+    db.update_run(
+        run_id,
+        pid=pid,
+        process_meta={
+            "phase": phase,
+            "pid": pid,
+            "pgid": pgid,
+            "match": match,
+            "identity": identity,
+        },
+    )
+
+
+def _foreign_phase_alive(db: Database, run_id: str) -> bool:
+    """True when a provider, inspect, or verification child is still that child."""
+    run = db.get_run(run_id)
+    if run is None:
+        return False
+    meta = run.process_meta if isinstance(run.process_meta, dict) else {}
+    phase = str(meta.get("phase") or "")
+    if phase not in {"provider", "verifying", "inspect"}:
+        return False
+    try:
+        pid = int(meta.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid == os.getpid():
+        return False
+    return phase_process_alive(meta, fallback_pid=run.pid)
+
+
+def _checkpoint_cancel(db: Database, run_id: str) -> None:
+    current = db.get_run(run_id)
+    if current is not None and current.state == RunState.CANCELLED.value:
+        raise RunCancelled()
 
 
 def _emit(db: Database, run_dir: Path, run_id: str, kind: str, message: str, state: str | None) -> None:
@@ -657,23 +822,23 @@ def _write_metadata(run_dir: Path, run: RunRecord) -> None:
     )
 
 
-def _child_env(
+def _runtime_env(
     config: Config,
-    run_dir: Path,
+    root: Path,
     workspace: Path,
     source: Path,
     run_id: str,
     *,
-    copy_auth: bool = True,
+    copy_auth: bool,
 ) -> dict[str, str]:
     del run_id
-    bin_dir = run_dir / "bin"
-    hooks = run_dir / "empty-hooks"
-    gitconfig = run_dir / "empty-gitconfig"
+    bin_dir = root / "bin"
+    hooks = root / "empty-hooks"
+    gitconfig = root / "empty-gitconfig"
     write_private_text(gitconfig, "")
-    grok_home = prepare_run_grok_home(run_dir, config.auth_store(), copy_auth=copy_auth)
-    runtime_home, private_tmp = prepare_runtime_dirs(run_dir)
-    staged = stage_pythonpath(run_dir)
+    grok_home = prepare_run_grok_home(root, config.auth_store(), copy_auth=copy_auth)
+    runtime_home, private_tmp = prepare_runtime_dirs(root)
+    staged = stage_pythonpath(root)
     real = {
         "git": shutil.which(GIT_BIN) or shutil.which("git") or "",
         "gh": shutil.which("gh") or "",
@@ -708,28 +873,69 @@ def _child_env(
     return apply_runtime_env(env, runtime_home=runtime_home, grok_home=grok_home, private_tmp=private_tmp)
 
 
+def _provider_env(config: Config, attempt: Path, workspace: Path, source: Path, run_id: str) -> dict[str, str]:
+    """Provider runtime. Its control files are not the verification launcher."""
+    return _runtime_env(config, attempt, workspace, source, run_id, copy_auth=True)
+
+
+def _verification_env(config: Config, attempt: Path, workspace: Path, source: Path, run_id: str) -> dict[str, str]:
+    """Fresh verification runtime built after the provider exits.
+
+    The directory is created here, so the provider profile never included it.
+    No auth file is copied. A passing check means the declared command passed
+    inside the mutable workspace. It does not prove the model could not edit
+    that command's inputs.
+    """
+    root = ensure_private_dir(attempt / "verify-runtime")
+    return _runtime_env(config, root, workspace, source, run_id, copy_auth=False)
+
+
+def provider_write_roots(workspace: Path, attempt: Path, *, write_scope: str) -> list[Path]:
+    """Directories the provider may write. The run's control files are absent."""
+    roots = [
+        attempt / "grok-home",
+        attempt / "runtime-home",
+        attempt / "tmp",
+    ]
+    if write_scope != "none":
+        roots.insert(0, workspace)
+    return roots
+
+
 def _provider_profile(
     config: Config,
-    run_dir: Path,
+    attempt: Path,
     workspace: Path,
     *,
     source: Path,
     network: bool,
+    write_scope: str,
 ) -> Path:
     return write_profile(
-        run_dir / "provider.sb",
-        writable=[workspace, run_dir],
+        attempt / "provider.sb",
+        writable=provider_write_roots(workspace, attempt, write_scope=write_scope),
         network=network,
-        read_policy=_read_policy(config, run_dir, workspace, source),
+        read_policy=_read_policy(config, attempt, workspace, source),
     )
 
 
-def _verification_profile(config: Config, run_dir: Path, workspace: Path, source: Path) -> Path:
+def _preflight_profile(config: Config, attempt: Path, workspace: Path, source: Path) -> Path:
+    """Inspect profile. Network is denied. Writable roots match the provider runtime."""
     return write_profile(
-        run_dir / "verification.sb",
-        writable=[workspace, run_dir],
+        attempt / "inspect.sb",
+        writable=provider_write_roots(workspace, attempt, write_scope="none"),
         network=False,
-        read_policy=_read_policy(config, run_dir, workspace, source),
+        read_policy=_read_policy(config, attempt, workspace, source),
+    )
+
+
+def _verification_profile(config: Config, attempt: Path, workspace: Path, source: Path) -> Path:
+    verify_root = attempt / "verify-runtime"
+    return write_profile(
+        attempt / "verification.sb",
+        writable=[workspace, verify_root / "runtime-home", verify_root / "tmp"],
+        network=False,
+        read_policy=_read_policy(config, verify_root, workspace, source, extra=[workspace, verify_root]),
     )
 
 
@@ -812,15 +1018,18 @@ def _readers_saw(profile: Path, workspace: Path, env: dict[str, str], target: Pa
     return False
 
 
-def _read_policy(config: Config, run_dir: Path, workspace: Path, source: Path):
+def _read_policy(config: Config, root: Path, workspace: Path, source: Path, extra: list[Path] | None = None):
     runtime_roots = [
         workspace,
-        run_dir,
-        run_dir / "runtime-home",
-        run_dir / "grok-home",
-        run_dir / "tmp",
-        run_dir / "pythonpath",
+        root,
+        root / "runtime-home",
+        root / "grok-home",
+        root / "tmp",
+        root / "pythonpath",
+        root / "bin",
     ]
+    for item in extra or []:
+        runtime_roots.append(item)
     return build_read_policy(
         runtime_roots=runtime_roots,
         source_root=source,
@@ -840,10 +1049,12 @@ def _invocation(
     instructions: list[str],
 ) -> dict:
     version = ""
+    version_containment = "not-run"
     if job.provider == "grok" and os.environ.get("NIGHTSHIFT_FORBID_GROK") != "1":
-        version = _grok_version()
+        version, version_containment = _grok_version()
     return {
         "binary_version": version,
+        "binary_version_containment": version_containment,
         "model": job.model or "",
         "session_id": session_id,
         "permission_mode": policy.permission_mode,
@@ -867,14 +1078,13 @@ def _invocation(
     }
 
 
-def _grok_version() -> str:
-    import subprocess
+def _grok_version() -> tuple[str, str]:
+    import shutil
 
-    try:
-        proc = subprocess.run(["grok", "--version"], check=False, capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return (proc.stdout or proc.stderr or "").splitlines()[0] if proc.returncode == 0 else ""
+    from nightshift.doctor import read_grok_version
+
+    binary = shutil.which("grok") or "grok"
+    return read_grok_version(binary)
 
 
 def _maybe_remove_worktree(config: Config, source: Path, dest: Path, state: str, isolation: str) -> None:

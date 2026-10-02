@@ -65,8 +65,8 @@ def prepare_run_grok_home(run_dir: Path, auth_store: Path, *, copy_auth: bool = 
     """Create a private per-run GROK_HOME.
 
     Provider launches copy the minimum auth file. Verification does not.
-    A verification child can read the run directory, so leaving the copy
-    there would publish the credential to that command.
+    The copy is removed before verification, and verification uses a separate
+    runtime directory.
 
     A symlink at `grok-home` is removed and not followed. The persistent
     store is never the directory this function writes.
@@ -85,13 +85,24 @@ def prepare_run_grok_home(run_dir: Path, auth_store: Path, *, copy_auth: bool = 
 
 
 def scrub_per_run_auth(run_dir: Path) -> bool:
-    """Remove the per-run auth copy. Keep other files and the persistent store.
+    """Remove per-run and per-attempt auth copies. Keep the persistent store.
 
     When `grok-home` itself is a symlink, only that link is removed. The
     function does not follow it, and it does not raise: callers in `finally`
     still have to release locks.
     """
-    home = per_run_grok_home(run_dir)
+    removed = _scrub_one_home(per_run_grok_home(run_dir))
+    info = _lstat(run_dir)
+    if info is not None and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        for child in sorted(run_dir.glob("attempt-*")):
+            child_info = _lstat(child)
+            if child_info is None or stat.S_ISLNK(child_info.st_mode) or not stat.S_ISDIR(child_info.st_mode):
+                continue
+            removed = _scrub_one_home(per_run_grok_home(child)) or removed
+    return removed
+
+
+def _scrub_one_home(home: Path) -> bool:
     try:
         if _drop_directory_symlink(home):
             return True
@@ -103,6 +114,12 @@ def scrub_per_run_auth(run_dir: Path) -> bool:
             return False
 
 
+def attempt_dir(run_dir: Path, attempt: int) -> Path:
+    """Directory that holds one attempt's provider and verification runtime."""
+    number = attempt if attempt > 0 else 1
+    return run_dir / f"attempt-{number}"
+
+
 def stage_pythonpath(run_dir: Path) -> Path:
     """Copy the Nightshift package into the run so the child need not read the source tree."""
     import nightshift
@@ -110,7 +127,9 @@ def stage_pythonpath(run_dir: Path) -> Path:
     package = Path(nightshift.__file__).resolve().parent
     dest_root = ensure_private_dir(run_dir / "pythonpath")
     dest_pkg = dest_root / "nightshift"
-    if dest_pkg.exists():
+    if dest_pkg.is_symlink():
+        dest_pkg.unlink()
+    elif dest_pkg.exists():
         shutil.rmtree(dest_pkg)
     for path in package.rglob("*.py"):
         if "__pycache__" in path.parts:
