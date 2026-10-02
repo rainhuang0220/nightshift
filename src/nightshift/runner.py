@@ -678,6 +678,8 @@ def _invocation(
         "session_id": session_id,
         "permission_mode": policy.permission_mode,
         "sandbox_profile": policy.sandbox_profile,
+        "grok_sandbox_flag": "omitted",
+        "grok_sandbox_reason": "nested sandbox_init returns EPERM inside the seatbelt",
         "seatbelt": "deny-default",
         "max_turns": config.max_turns,
         "memory_disabled": True,

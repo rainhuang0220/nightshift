@@ -5,7 +5,10 @@ not choose what the model should do. `grok agent headless` is a WebSocket
 relay and is not used. `--worktree` is not used; Nightshift owns isolation.
 `--always-approve` and `--permission-mode bypassPermissions` are never emitted.
 `--no-memory` and `--no-auto-update` are accepted by this binary even though
-the help summary omits them.
+the help summary omits them. `--sandbox` is accepted by the binary and works
+when Grok is not already seatbelted. Inside Nightshift's seatbelt, applying
+that profile fails with EPERM and Grok refuses to start, so the flag is not
+emitted. The seatbelt is the containment.
 """
 
 from __future__ import annotations
@@ -41,8 +44,6 @@ def build_grok_argv(
         "streaming-json",
         "--permission-mode",
         policy.permission_mode,
-        "--sandbox",
-        policy.sandbox_profile,
         "--max-turns",
         str(max_turns),
         "--no-subagents",

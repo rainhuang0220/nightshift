@@ -27,7 +27,14 @@ An allowed interpreter can still invoke an absolute binary, open a socket, or ca
 
 ### 3. Grok `--sandbox` flag
 
-**Requested, and not the boundary Nightshift relies on.** `--sandbox workspace` is passed when `write_scope` is `workspace`. `--sandbox read-only` is passed when `write_scope` is `none`. Profile names come from the installed Grok user guide. A profile that fails to apply is a Grok warning, and Grok may continue. Nightshift's own seatbelt is control 5. Do not treat the flag as the proof of filesystem containment.
+**Not applied.** The installed CLI accepts `--sandbox workspace` and `--sandbox read-only`. On this machine the flag applies when Grok is the outer process: a one-turn prompt returned the model's reply and an empty stderr. The same flag inside Nightshift's seatbelt fails before the model starts:
+
+```text
+sandbox initialization failed: Operation not permitted
+Refusing to start with its protections missing.
+```
+
+A wide outer profile still gets that EPERM, so this is nested `sandbox_init`, not a missing file allow. Grok fails closed, which would turn every contained run into an immediate provider exit 1. Nightshift omits the flag. The seatbelt in control 5 is the filesystem and process containment. The write-scope name stays on the invocation as a label for the permission rules.
 
 ### 4. Independent clone
 

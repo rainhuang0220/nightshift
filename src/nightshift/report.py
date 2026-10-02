@@ -207,6 +207,8 @@ def _collect_text(value, parts: list[str], *, depth: int) -> None:
     if depth > 6 or len(parts) > 40:
         return
     if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("data"), str) and value["data"].strip():
+            parts.append(value["data"].strip())
         for key in ("text", "message", "content", "result"):
             item = value.get(key)
             if isinstance(item, str) and item.strip():

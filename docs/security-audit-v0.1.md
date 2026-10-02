@@ -77,4 +77,4 @@ Layer: **containment** of the files, with best-effort redaction. Not a cryptogra
 
 The Grok provider seatbelt allows network so the model API can be reached. A network `git push` is not an OS hard block. A local bare-repo push is a filesystem write and is a hard block. The safety gate for a clean real probe is `PASS_WITH_LIMITATIONS` while that network allowance stands.
 
-Grok's own `--sandbox` flag is still passed. It is not the containment Nightshift claims. The seatbelt is.
+Grok's own `--sandbox` flag is not passed. Inside the seatbelt it fails to initialize and Grok refuses to start. The seatbelt is the containment Nightshift claims.

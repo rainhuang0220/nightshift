@@ -36,10 +36,11 @@ The Grok argv for an unattended job adds the flags this binary accepts:
 --no-auto-update
 --disable-web-search          # when job.network is false
 --output-format streaming-json
---sandbox <workspace|read-only>
 --max-turns <n>
 --session-id <id>
 ```
+
+`--sandbox` is omitted. See "Seatbelt and Grok's sandbox flag" below.
 
 `--no-memory` and `--no-auto-update` are accepted by Grok 1.0.46 even though the help summary omits them. Nightshift does not emit flags this binary rejects. It does not emit `--always-approve`, `bypassPermissions`, `--worktree`, or `grok agent headless`.
 
@@ -93,7 +94,9 @@ A target repository may contain `.grok/`, `.mcp.json`, `.cursor/mcp.json`, Curso
 
 ## Seatbelt and Grok's sandbox flag
 
-Nightshift passes Grok's `--sandbox` flag and also wraps the process with `/usr/bin/sandbox-exec`.
+Nightshift wraps the process with `/usr/bin/sandbox-exec` and does not pass `--sandbox`.
+
+A check on Grok 1.0.46 showed two different results. Outside the seatbelt, `--sandbox workspace` applied and the model answered. Inside the seatbelt, including under a wide outer profile, Grok printed `sandbox initialization failed: Operation not permitted` and refused to start. Nested sandbox setup is denied by the kernel. Passing the flag would make every contained launch exit 1 before the model runs. The seatbelt remains in place either way.
 
 The seatbelt is the containment Nightshift enforces:
 
@@ -104,7 +107,7 @@ The seatbelt is the containment Nightshift enforces:
 - verification denies network
 - the Grok provider allows network
 
-Grok's `--sandbox` flag is an additional request to Grok. A Grok profile that fails to apply does not remove the seatbelt. If `sandbox-exec` itself is missing, Nightshift blocks the run.
+If `sandbox-exec` itself is missing, Nightshift blocks the run. It does not fall through to Grok's own sandbox flag.
 
 The last matching seatbelt rule wins, so credential read denials are written after the general read allow. Writable paths are resolved so a `/var` path and its `/private/var` alias name the same directory.
 

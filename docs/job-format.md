@@ -62,9 +62,9 @@ Verification commands are trusted operator input. Nightshift snapshots them into
 
 ## Write scope
 
-`none` asks Grok for a read-only sandbox profile and does not allow Edit/Write through Grok's permission rules. `workspace` asks for the `workspace` sandbox profile and allows edits and local git commits inside the isolated workspace. Neither scope permits push, publishing, or edits to the original checkout.
+`none` withholds Edit/Write in Grok's permission rules. `workspace` allows edits and local git commits inside the isolated workspace through those rules. Neither scope permits push, publishing, or edits to the original checkout.
 
-Those Grok profiles are tool-call filters plus a flag Grok may or may not enforce. Filesystem containment is the seatbelt. See `docs/threat-model.md`.
+The write scope is also recorded as the label `read-only` or `workspace`. Nightshift does not pass `--sandbox` with that label. Nested sandbox setup fails inside the seatbelt, and Grok then refuses to start. Filesystem containment is the seatbelt. See `docs/threat-model.md`.
 
 ## Forbidden `allow_bash` snippets
 

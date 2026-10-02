@@ -176,7 +176,9 @@ A live PID is accepted only when `ps` shows the session token. A recycled PID is
 
 ## Grok adapter
 
-`build_grok_argv` uses flags accepted by the installed Grok 1.0.46 CLI: `--cwd`, `--prompt-file`, `--output-format streaming-json`, `--permission-mode`, `--sandbox`, `--max-turns`, `--no-subagents`, `--no-memory`, `--no-auto-update`, `--rules`, `--session-id` or `--resume`, optional `--model`, `--disable-web-search`, and repeated `--deny` / `--allow`. `--no-memory` and `--no-auto-update` are accepted by this binary even though the help summary omits them. Nightshift creates the workspace itself; `--worktree` is not passed. `grok agent headless` is a WebSocket relay and is not the prompt API.
+`build_grok_argv` uses flags accepted by the installed Grok 1.0.46 CLI: `--cwd`, `--prompt-file`, `--output-format streaming-json`, `--permission-mode`, `--max-turns`, `--no-subagents`, `--no-memory`, `--no-auto-update`, `--rules`, `--session-id` or `--resume`, optional `--model`, `--disable-web-search`, and repeated `--deny` / `--allow`. `--no-memory` and `--no-auto-update` are accepted by this binary even though the help summary omits them. Nightshift creates the workspace itself; `--worktree` is not passed. `grok agent headless` is a WebSocket relay and is not the prompt API.
+
+`--sandbox` is accepted by this binary. A startup check showed that `--sandbox workspace` applies when Grok is not already under `sandbox-exec`, and that the same flag inside Nightshift's seatbelt fails with `sandbox initialization failed: Operation not permitted`. Grok then refuses to start. Nested `sandbox_init` stays denied even under a wide outer profile. Nightshift therefore omits `--sandbox` and keeps the seatbelt. The invocation records `grok_sandbox_flag: omitted` and the write-scope profile name (`workspace` or `read-only`) as a label, not as an applied Grok jail.
 
 The child also gets `GROK_MEMORY=0` and `GROK_WORKFLOWS=0`.
 
@@ -184,7 +186,7 @@ Invocation metadata stored on the run records binary version, model, session id,
 
 `NIGHTSHIFT_FORBID_GROK=1` blocks the launch before `inspect`. That variable is an operator circuit breaker for tests.
 
-The seatbelt wraps the provider with `/usr/bin/sandbox-exec`. Grok's own `--sandbox` flag is still passed. The seatbelt is the containment Nightshift enforces itself. See `docs/grok-runtime-isolation.md`.
+The seatbelt wraps the provider with `/usr/bin/sandbox-exec`. See `docs/grok-runtime-isolation.md`.
 
 ## Logs and the morning report
 

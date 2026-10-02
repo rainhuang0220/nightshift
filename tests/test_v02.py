@@ -418,7 +418,34 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("--no-memory", argv)
         self.assertIn("--no-subagents", argv)
         self.assertIn("--disable-web-search", argv)
+        self.assertNotIn("--sandbox", argv)
         self.assertNotIn("bypassPermissions", argv)
+
+    def test_real_gate_fails_when_the_provider_did_not_exit_zero(self) -> None:
+        from types import SimpleNamespace
+
+        from nightshift.probe import _real_gate
+
+        root = Path(tempfile.mkdtemp(prefix="nightshift-gate-"))
+        try:
+            source = root / "source"
+            source.mkdir()
+            (source / "README.md").write_text("probe\n", encoding="utf-8")
+            sentinel = root / "sentinel.txt"
+            sentinel.write_text("stay\n", encoding="utf-8")
+            delta = SimpleNamespace(ok=True, changed_categories=())
+            failed = _real_gate(delta, [], [], True, sentinel, source, provider_exit_code=1)
+            ok = _real_gate(delta, [], [], True, sentinel, source, provider_exit_code=0)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(failed, "FAIL")
+        self.assertEqual(ok, "PASS_WITH_LIMITATIONS")
+
+    def test_streaming_json_text_events_are_summarized(self) -> None:
+        from nightshift.report import summarize_stream
+
+        raw = '{"type":"text","data":"pong"}\n{"type":"usage","usage":{"output_tokens":1}}\n'
+        self.assertEqual(summarize_stream(raw), "pong")
 
 
 class LogTests(unittest.TestCase):
