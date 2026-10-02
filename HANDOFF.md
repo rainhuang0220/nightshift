@@ -8,7 +8,7 @@ Nightshift queues a versioned `job.toml` plus `prompt.md`, locks the concurrency
 
 `decide_final` is the only success gate. Normal execution, verification recovery, and recorded-state finalization all use it. `SUCCEEDED` requires provider exit 0, verification that ran and exited 0, a workspace on disk, a passing source-integrity snapshot, and a passing extension audit when the provider is Grok. `recover` classifies active rows and does not relaunch a provider. `recover --retry` is the only way back to `QUEUED`, and it stops at `max_attempts`.
 
-The Grok adapter builds a process argv from flags on the installed Grok 1.0.46 CLI and wraps the process with `/usr/bin/sandbox-exec`. The child `HOME` is `runs/<id>/runtime-home`. `GROK_HOME` is `state/grok-profile`. Tests and the default safety probe use FakeProvider. `NIGHTSHIFT_FORBID_GROK=1` blocks a Grok launch before `grok inspect`.
+The Grok adapter builds a process argv from flags on the installed Grok 1.0.46 CLI and wraps the process with `/usr/bin/sandbox-exec`. The child `HOME` is `runs/<id>/attempt-<n>/runtime-home`. `GROK_HOME` is `runs/<id>/attempt-<n>/grok-home`. Tests and the default safety probe use FakeProvider. `NIGHTSHIFT_FORBID_GROK=1` blocks a Grok launch before `grok inspect`.
 
 `isolation = "worktree"` remains available. It shares the source git directory and is not the unattended default.
 
@@ -187,7 +187,7 @@ The model process exited 0 and did not leave `nightshift-notes/probe.txt` or a c
 
 - The default provider cwd is an independent clone. Nightshift does not clean, reset, stash, or checkout the source tree. A clone commit does not update source refs or the source worktree registry.
 - `decide_final` withholds `SUCCEEDED` when any protected source category changes, including on recovery. Nightshift does not restore the source.
-- Grok jobs run under a private HOME and `state/grok-profile`. `grok inspect --json` must pass before the model starts.
+- Grok jobs run under a per-attempt private HOME and `GROK_HOME` at `runs/<id>/attempt-<n>/`. `grok inspect --json` must pass before the model starts.
 - The seatbelt is the filesystem containment. The PATH shim and Grok allow rules are defense in depth. The prompt is advisory.
 - Verification of a Grok job is an argv under a network-denying seatbelt. Legacy shell verification is blocked for Grok unless the job opts in.
 - `recover` does not restart work and does not increment `attempt`.
@@ -197,7 +197,7 @@ The model process exited 0 and did not leave `nightshift-notes/probe.txt` or a c
 
 - The Grok provider seatbelt allows network so the model API can be reached. An https or ssh `git push` is not an OS hard block. A local bare push is. A clean real probe is `PASS_WITH_LIMITATIONS` while this stands.
 - Grok's `--sandbox` flag is omitted. Nested sandbox setup returns EPERM inside the seatbelt, and Grok refuses to start. The seatbelt is the containment.
-- The first `grok inspect` or launch materializes the CLI's bundled skills into `state/grok-profile`. That set is the product bundle (22 skills on this machine), not the operator's skills, plugins, hooks, or MCP servers. The audit accepts a bundled skill only when its path is under that profile.
+- The first `grok inspect` or launch materializes the CLI's bundled skills into that attempt's `grok-home`. That set is the product bundle (22 skills on this machine), not the operator's skills, plugins, hooks, or MCP servers. The audit accepts a bundled skill only when its path is under that profile.
 - Redaction is best-effort. It is not a guarantee over arbitrary repository content.
 - Prompt compliance is not a hard block. The probe classifies a block from the seatbelt or the shim.
 - Human review is required on every report, including `SUCCEEDED`.

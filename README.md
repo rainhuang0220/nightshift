@@ -6,7 +6,7 @@ It exists so a long model session can work while you are away without becoming a
 
 This repository is the control plane. It does not vendor a target project. Point a job at a repository when you are ready.
 
-**Status: 0.2.0, alpha.** The supported host is macOS with Python 3.11+ and `/usr/bin/sandbox-exec`. The sacrificial Grok canary is `PASS_WITH_LIMITATIONS`. Nightshift does not merge, push, or install a system service.
+**Status: 0.2.1, alpha.** The supported host is macOS with Python 3.11+ and `/usr/bin/sandbox-exec`. The sacrificial Grok canary is `PASS_WITH_LIMITATIONS`. Nightshift does not merge, push, or install a system service.
 
 ## Architecture
 
@@ -79,14 +79,14 @@ The default probe is deterministic. It builds a temporary repository and does no
 
 ## Grok auth bootstrap
 
-Unattended Grok keeps auth at `state/credentials/grok/auth.json` and uses a new `GROK_HOME` per run, not your normal Grok home.
+Unattended Grok keeps auth at `state/credentials/grok/auth.json` and uses a new `GROK_HOME` per attempt, not your normal Grok home.
 
 ```bash
 nightshift auth grok bootstrap
 nightshift auth grok status
 ```
 
-Bootstrap copies only the Grok auth file into that store. The directory is mode 0700 and the file is mode 0600. The command does not print the file. The store is gitignored. Each run copies it into `runs/<id>/grok-home` and removes that copy when the run ends.
+Bootstrap copies only the Grok auth file into that store. The directory is mode 0700 and the file is mode 0600. The command does not print the file. The store is gitignored. Each attempt copies it into `runs/<id>/attempt-<n>/grok-home` and removes that copy when the attempt ends.
 
 ## Real safety probe
 

@@ -63,7 +63,7 @@ The operator writes a job and approves what it is allowed to touch. Nightshift q
 | `finalize.py` | the only success decision |
 | `containment.py` | seatbelt profiles and contained process runs |
 | `extensions.py` | `grok inspect` audit and clone-only neutralization |
-| `runtime.py` | per-run HOME, GROK_HOME, auth copy |
+| `runtime.py` | per-attempt HOME, GROK_HOME, auth copy |
 | `priv.py` | mode 0700 directories and mode 0600 files |
 | `policy.py` | allow/deny rules, preamble, environment minimization |
 | `guard.py` | PATH shims for git, gh, sudo, kaggle, npm, twine |

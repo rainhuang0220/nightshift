@@ -4,15 +4,15 @@ Unattended Nightshift does not run Grok under the operator's normal extension en
 
 ## Dedicated runtime HOME
 
-Each run gets `runs/<run-id>/runtime-home/`, mode 0700. The child `HOME` is that directory. The operator's home is not passed through.
+Each attempt gets `runs/<id>/attempt-<n>/runtime-home/`, mode 0700. The provider child's `HOME` is that directory. Verification uses a fresh `runs/<id>/attempt-<n>/verify-runtime/runtime-home` created after the provider exits. The operator's home is not passed through.
 
 That stops automatic discovery of user-level directories that live under the normal home, including `.agents`, `.claude`, `.cursor`, ordinary dotfiles, and credential files that tools look up relative to `HOME`.
 
-`TMPDIR`, `TEMP`, and `TMP` point at `runs/<run-id>/tmp`, also mode 0700. Nightshift does not widen the seatbelt to the system temp directory to silence cache warnings.
+`TMPDIR`, `TEMP`, and `TMP` point at `runs/<id>/attempt-<n>/tmp`, also mode 0700. Nightshift does not widen the seatbelt to the system temp directory to silence cache warnings.
 
 ## Dedicated GROK_HOME
 
-`GROK_HOME` is `runs/<run-id>/grok-home/`, mode 0700, created for that run. The next run gets a new directory. The profile contains only what Nightshift copies in and what the CLI materializes during that run.
+`GROK_HOME` is `runs/<id>/attempt-<n>/grok-home/`, mode 0700, created for that attempt. The next attempt gets a new directory. The profile contains only what Nightshift copies in and what the CLI materializes during that attempt.
 
 Nightshift does not copy:
 
@@ -61,7 +61,7 @@ nightshift auth grok bootstrap
 
 `bootstrap` copies one file, `auth.json`, from the operator's Grok profile into `state/credentials/grok/auth.json`. The parent directory is mode 0700. The file is mode 0600. The copy is a separate file, not a symlink. The command's stdout is the word `bootstrapped`. Contents are never printed. If that store is empty and a legacy `state/grok-profile/auth.json` is a regular file, Nightshift copies it once and leaves the legacy file in place.
 
-Each Grok launch copies that auth file into the per-attempt `GROK_HOME` at `runs/<id>/attempt-<n>/grok-home`. A retry gets a new directory and a new session id. It does not resume the previous conversation. After the provider exits, Nightshift removes that copy before verification runs. Cancel, interrupt, and recovery of a dead phase remove it as well. Recovery leaves a live phase's copy in place. Verification recovery does not copy the file again. If `grok-home` itself is a symlink, Nightshift unlinks that symlink and does not follow it into the credential store. Copying `auth.json` refuses a symlinked parent and opens the destination without following a final symlink. Diagnostic files in a real per-run home stay. The persistent store is never deleted automatically and is not a provider writable root.
+Each Grok launch copies that auth file into the per-attempt `GROK_HOME` at `runs/<id>/attempt-<n>/grok-home`. A retry gets a new directory and a new session id. It does not resume the previous conversation. After the provider exits, Nightshift removes that copy before verification runs. Cancel, interrupt, and recovery of a dead phase remove it as well. Recovery leaves a live phase's copy in place. Verification recovery does not copy the file again. If `grok-home` itself is a symlink, Nightshift unlinks that symlink and does not follow it into the credential store. Copying `auth.json` refuses a symlinked parent and opens the destination without following a final symlink. Diagnostic files in a real per-attempt home stay. The persistent store is never deleted automatically and is not a provider writable root.
 
 No other auth file is copied unless a real launch shows that the CLI requires it. Unit tests use a synthetic auth file. The real file is gitignored with the rest of `state/`.
 
@@ -138,7 +138,7 @@ Counts, not paths:
 - MCP servers 0
 - operator-global instructions 0
 - builtin agents only
-- skills: the CLI's bundled set, paths under that run's `grok-home`, and no user, project, or plugin skills
+- skills: the CLI's bundled set, paths under that attempt's `grok-home`, and no user, project, or plugin skills
 - permission sources empty and permissions loaded 0
 
 The operator's normal inspect is a different process, with the operator's home and the operator's `GROK_HOME`. Those counts must not appear in the Nightshift child. The safety probe checks that, and a mismatch blocks the launch.

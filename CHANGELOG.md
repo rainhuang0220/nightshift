@@ -7,6 +7,8 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-03
+
 ### Security
 
 - Provider filesystem reads are deny-by-default. The seatbelt allows required system and toolchain reads, denies the operator home and the original source checkout, then re-allows only the isolated workspace, the attempt directory, the private runtime home, the per-attempt `GROK_HOME`, the resolved tool path, and optional `[containment] read_roots`. Ancestor directories of those roots get `file-read-metadata` only, so a path walk can stat them without listing or reading their contents. There is no global file-read allow. A job prompt cannot add a read root.
@@ -26,7 +28,7 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The morning report includes a short trust-boundary section: per-run `GROK_HOME`, source read isolation, operator-home read isolation, source integrity, extension audit, and network containment.
+- The morning report includes a short trust-boundary section: per-attempt `GROK_HOME`, source read isolation, operator-home read isolation, source integrity, extension audit, and network containment.
 - `nightshift safety probe` reports filesystem write containment, filesystem read containment, the accepted provider-network limitation, cross-run runtime isolation, trusted-parent symlink handling, provider control-directory writes, atomic lock ownership, attempt isolation, and checkout hook isolation as separate rows. The default probe does not call Grok.
 - The policy preamble says local commits are in the workspace. The unimplemented `cursor` provider error no longer says `v0.1`.
 
@@ -76,6 +78,7 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `recover` classifies active runs and does not relaunch a provider.
 - A missing workspace on a dead run is `process_gone_workspace_missing` and `FAILED`.
 
-[Unreleased]: https://github.com/rainhuang0220/nightshift/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rainhuang0220/nightshift/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/rainhuang0220/nightshift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rainhuang0220/nightshift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rainhuang0220/nightshift/releases/tag/v0.1.0
