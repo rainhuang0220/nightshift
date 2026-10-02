@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from nightshift.priv import ensure_private_dir
+
 import tomllib
 
 from nightshift.models import UsageError
@@ -30,9 +32,13 @@ class Config:
     destroy_failed_worktrees: bool = False
 
     def ensure_dirs(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.state_dir)
+        ensure_private_dir(self.runs_dir)
+        ensure_private_dir(self.worktrees_dir)
+        ensure_private_dir(self.state_dir / "grok-profile")
+
+    def grok_profile(self) -> Path:
+        return self.state_dir / "grok-profile"
 
 
 def load_config(root: Path | None = None, config_path: Path | None = None) -> Config:

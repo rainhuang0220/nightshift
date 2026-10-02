@@ -1,4 +1,5 @@
 state/
+state/grok-profile/
 runs/
 worktrees/
 .venv/

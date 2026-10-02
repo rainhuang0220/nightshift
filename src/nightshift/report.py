@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 from dataclasses import dataclass, field
 
@@ -42,16 +43,17 @@ class ReportInputs:
     artifacts_found: list[str] = field(default_factory=list)
     human_review_required: bool = True
     recovery_class: str = ""
+    isolation: str = "clone"
+    import_note: str = (
+        "Nightshift does not merge or push. Review the isolated workspace and import commits by hand."
+    )
 
 
 def extract_findings(text: str) -> str:
     lines = [line for line in text.splitlines() if line.startswith("finding:")]
     if lines:
         return "\n".join(lines)
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    return stripped[-2000:]
+    return ""
 
 
 def extract_metrics(text: str) -> dict[str, str]:
@@ -167,6 +169,8 @@ def render_report(info: ReportInputs) -> str:
             "",
             "## Human review",
             f"Human review required: {review}",
+            f"- Isolation: {info.isolation or 'clone'}",
+            f"- Import: {info.import_note}",
             "",
             "## Inspect",
             "These commands are read-only.",
@@ -176,6 +180,43 @@ def render_report(info: ReportInputs) -> str:
             "",
         ]
     )
+
+
+def summarize_stream(text: str) -> str:
+    """Pull text fields out of streaming JSON. Unknown shapes are ignored.
+
+    The raw log stays on disk. Reports use this summary instead of scraping
+    the whole provider transcript.
+    """
+    parts: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        _collect_text(event, parts, depth=0)
+        if sum(len(part) for part in parts) > 4000:
+            break
+    return "\n".join(parts)
+
+
+def _collect_text(value, parts: list[str], *, depth: int) -> None:
+    if depth > 6 or len(parts) > 40:
+        return
+    if isinstance(value, dict):
+        for key in ("text", "message", "content", "result"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                _collect_text(item, parts, depth=depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_text(item, parts, depth=depth + 1)
 
 
 def _inspect_commands(info: ReportInputs) -> list[str]:

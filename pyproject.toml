@@ -1,7 +1,7 @@
 [project]
 name = "nightshift"
-version = "0.1.0"
-description = "Local control plane for unattended overnight work in isolated git worktrees."
+version = "0.2.0"
+description = "Local control plane for unattended overnight work in isolated git clones."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

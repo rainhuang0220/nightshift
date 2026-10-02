@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import tomllib
@@ -29,7 +30,9 @@ _REQUIRED = (
     "verification",
     "success_criteria",
 )
-_OPTIONAL = {"model", "allow_bash"}
+_OPTIONAL = {"model", "allow_bash", "isolation", "allow_legacy_shell_verification"}
+_ISOLATION = {"clone", "worktree"}
+_STEP_KEYS = {"argv", "timeout_seconds"}
 _FORBIDDEN_ALLOW = (
     "git push",
     "sudo",
@@ -77,6 +80,7 @@ def load_job(path: Path) -> Job:
     if errors:
         raise JobValidationError(errors)
     model = data.get("model")
+    display, steps = _verification_value(data["verification"])
     return Job(
         schema_version=int(data["schema_version"]),
         id=str(data["id"]),
@@ -92,12 +96,15 @@ def load_job(path: Path) -> Job:
         network=bool(data["network"]),
         write_scope=str(data["write_scope"]).strip(),
         expected_artifacts=[str(x) for x in data["expected_artifacts"]],
-        verification=[str(x) for x in data["verification"]],
+        verification=display,
         success_criteria=[str(x) for x in data["success_criteria"]],
         allow_bash=[str(x) for x in data.get("allow_bash", [])],
         prompt=prompt,
         job_dir=str(job_file.parent.resolve()),
         job_file=str(job_file.resolve()),
+        isolation=str(data.get("isolation") or "clone"),
+        allow_legacy_shell=bool(data.get("allow_legacy_shell_verification", False)),
+        verification_steps=steps,
     )
 
 
@@ -145,8 +152,12 @@ def _validate(data: dict) -> list[str]:
         errors.append("network must be a boolean")
     if data["write_scope"] not in _WRITE_SCOPES:
         errors.append("write_scope must be 'none' or 'workspace'")
+    if "isolation" in data and data["isolation"] not in _ISOLATION:
+        errors.append("isolation must be 'clone' or 'worktree'")
+    if "allow_legacy_shell_verification" in data and not isinstance(data["allow_legacy_shell_verification"], bool):
+        errors.append("allow_legacy_shell_verification must be a boolean")
     errors.extend(_string_list(data, "expected_artifacts", allow_empty=True))
-    errors.extend(_string_list(data, "verification", allow_empty=True))
+    errors.extend(_verification(data))
     errors.extend(_string_list(data, "success_criteria", allow_empty=False))
     if "allow_bash" in data:
         errors.extend(_string_list(data, "allow_bash", allow_empty=True))
@@ -166,6 +177,74 @@ def _require_int(data: dict, key: str, *, minimum: int, maximum: int) -> list[st
     if value < minimum or value > maximum:
         return [f"{key} must be between {minimum} and {maximum}"]
     return []
+
+
+def _verification(data: dict) -> list[str]:
+    value = data["verification"]
+    if not isinstance(value, list):
+        return ["verification must be an array of strings or argv tables"]
+    if not value:
+        return []
+    if all(isinstance(item, str) for item in value):
+        return _string_list(data, "verification", allow_empty=True)
+    if any(isinstance(item, str) for item in value):
+        return ["verification must not mix shell strings and argv tables"]
+    errors: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            errors.append(f"verification[{index}] must be a string or a table")
+            continue
+        unknown = sorted(set(item) - _STEP_KEYS)
+        for key in unknown:
+            errors.append(f"verification[{index}] has unknown field {key!r}")
+        argv = item.get("argv")
+        if not isinstance(argv, list) or not argv:
+            errors.append(f"verification[{index}].argv must be a non-empty array of strings")
+        else:
+            for arg_index, arg in enumerate(argv):
+                if not isinstance(arg, str) or not arg.strip():
+                    errors.append(f"verification[{index}].argv[{arg_index}] must be a non-empty string")
+                elif "\x00" in arg:
+                    errors.append(f"verification[{index}].argv[{arg_index}] must not contain NUL")
+        if "timeout_seconds" in item:
+            timeout = item["timeout_seconds"]
+            if isinstance(timeout, bool) or not isinstance(timeout, int):
+                errors.append(f"verification[{index}].timeout_seconds must be an integer")
+            elif timeout < 1 or timeout > 86400:
+                errors.append(f"verification[{index}].timeout_seconds must be between 1 and 86400")
+    return errors
+
+
+def _verification_value(value: list) -> tuple[list[str], list[dict]]:
+    if not value:
+        return [], []
+    if all(isinstance(item, str) for item in value):
+        display = [str(item) for item in value]
+        steps = [
+            {"argv": ["/bin/sh", "-c", command], "shell": True, "display": command, "timeout_seconds": None}
+            for command in display
+        ]
+        return display, steps
+    display = []
+    steps = []
+    for item in value:
+        argv = [str(arg) for arg in item["argv"]]
+        timeout = item.get("timeout_seconds")
+        steps.append({"argv": argv, "shell": False, "display": shlex.join(argv), "timeout_seconds": timeout})
+        display.append(shlex.join(argv))
+    return display, steps
+
+
+def verification_plan(job: Job) -> list[dict]:
+    """Structured steps, or legacy shell steps synthesized from display strings."""
+    if job.verification_steps:
+        return list(job.verification_steps)
+    steps = []
+    for command in job.verification:
+        steps.append(
+            {"argv": ["/bin/sh", "-c", command], "shell": True, "display": command, "timeout_seconds": None}
+        )
+    return steps
 
 
 def _string_list(data: dict, key: str, *, allow_empty: bool) -> list[str]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -62,7 +63,9 @@ CREATE TABLE IF NOT EXISTS runs (
     recovery_class TEXT NOT NULL DEFAULT '',
     source_porcelain TEXT NOT NULL DEFAULT '',
     source_porcelain_after TEXT NOT NULL DEFAULT '',
-    provider_argv TEXT NOT NULL DEFAULT '[]'
+    provider_argv TEXT NOT NULL DEFAULT '[]',
+    source_integrity TEXT NOT NULL DEFAULT '',
+    invocation TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -86,7 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_state_created ON runs(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
 """
 
-_JSON_FIELDS = {"process_meta", "artifact_paths", "host_info", "provider_argv"}
+_JSON_FIELDS = {"process_meta", "artifact_paths", "host_info", "provider_argv", "invocation"}
 _BOOL_FIELDS = {"network", "verification_ran"}
 _MUTABLE = {
     "job_id",
@@ -130,12 +133,16 @@ _MUTABLE = {
     "source_porcelain",
     "source_porcelain_after",
     "provider_argv",
+    "source_integrity",
+    "invocation",
 }
 
 
 def _encode(key: str, value):
     if key in _JSON_FIELDS:
-        return json.dumps(value if value is not None else ([] if key != "process_meta" and key != "host_info" else {}))
+        if value is None:
+            value = {} if key in {"process_meta", "host_info", "invocation"} else []
+        return json.dumps(value)
     if key in _BOOL_FIELDS:
         return 1 if value else 0
     return value
@@ -147,6 +154,8 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
     data["artifact_paths"] = json.loads(data["artifact_paths"] or "[]")
     data["host_info"] = json.loads(data["host_info"] or "{}")
     data["provider_argv"] = json.loads(data["provider_argv"] or "[]")
+    data["invocation"] = json.loads(data.get("invocation") or "{}")
+    data["source_integrity"] = data.get("source_integrity") or ""
     data["network"] = bool(data["network"])
     data["verification_ran"] = bool(data["verification_ran"])
     return RunRecord(**data)
@@ -165,6 +174,17 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+        os.chmod(path, 0o600)
+        if path.parent.exists():
+            os.chmod(path.parent, 0o700)
+
+    def _migrate(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(runs)")}
+        if "source_integrity" not in columns:
+            self._conn.execute("ALTER TABLE runs ADD COLUMN source_integrity TEXT NOT NULL DEFAULT ''")
+        if "invocation" not in columns:
+            self._conn.execute("ALTER TABLE runs ADD COLUMN invocation TEXT NOT NULL DEFAULT '{}'")
 
     def close(self) -> None:
         with self._lock:

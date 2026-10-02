@@ -13,6 +13,7 @@ concurrency_group = "repo-audit-example"
 
 network = false
 write_scope = "none"
+isolation = "clone"
 
 expected_artifacts = []
 success_criteria = [

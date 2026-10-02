@@ -1,7 +1,8 @@
 """PATH shims for provider and verification subprocesses.
 
-The shim is a hard control for commands resolved through PATH. An absolute
-path such as /usr/bin/git bypasses it. Unknown git global options fail closed.
+The shim is defense in depth for commands resolved through PATH. It is not
+filesystem containment. An absolute path such as /usr/bin/git bypasses it.
+Unknown git global options fail closed.
 """
 
 from __future__ import annotations

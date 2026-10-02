@@ -1,4 +1,7 @@
 # Copy to config/nightshift.toml to override defaults.
+# Job isolation defaults to an independent clone. The optional worktree
+# backend shares source git metadata and is not the unattended default.
+# See docs/job-format.md.
 # Paths are relative to the Nightshift root (the process working directory,
 # or the directory passed as --root). Do not put secrets in this file.
 

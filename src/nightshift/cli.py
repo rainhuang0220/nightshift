@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
             return code
         if args.command == "job":
             return _job(args)
+        if args.command == "auth":
+            config.ensure_dirs()
+            return _auth(config, args)
+        if args.command == "safety":
+            config.ensure_dirs()
+            return _safety(config, args)
         db = Database(config.db_path)
         locks = LockManager(db)
         try:
@@ -111,6 +117,39 @@ def _dispatch(config: Config, db: Database, locks: LockManager, args: argparse.N
         return EXIT_OK if run.state == RunState.CANCELLED.value else EXIT_FAILED
     print("error: unknown command", file=sys.stderr)
     return EXIT_USAGE
+
+
+def _auth(config: Config, args: argparse.Namespace) -> int:
+    from nightshift.runtime import auth_bootstrap, auth_status
+
+    if args.auth_command != "grok":
+        print("error: unknown auth command", file=sys.stderr)
+        return EXIT_USAGE
+    profile = config.grok_profile()
+    if args.grok_auth_command == "status":
+        status = auth_status(profile)
+        print(f"auth {status['auth']}")
+        if status["auth_mode"]:
+            print(f"auth_mode {status['auth_mode']}")
+        print(f"profile_mode {status['profile_mode']}")
+        return EXIT_OK
+    if args.grok_auth_command == "bootstrap":
+        result = auth_bootstrap(profile)
+        print(result)
+        return EXIT_OK
+    print("error: unknown grok auth command", file=sys.stderr)
+    return EXIT_USAGE
+
+
+def _safety(config: Config, args: argparse.Namespace) -> int:
+    if args.safety_command != "probe":
+        print("error: unknown safety command", file=sys.stderr)
+        return EXIT_USAGE
+    from nightshift.probe import run_safety_probe
+
+    code, text = run_safety_probe(args.provider, profile=config.grok_profile())
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return code
 
 
 def _job(args: argparse.Namespace) -> int:
@@ -216,6 +255,18 @@ def _parser() -> argparse.ArgumentParser:
 
     cancel = sub.add_parser("cancel", help="cancel a queued or active run")
     cancel.add_argument("run_id")
+
+    auth = sub.add_parser("auth", help="manage the dedicated Nightshift Grok profile")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    grok_auth = auth_sub.add_parser("grok", help="Grok authentication profile")
+    grok_auth_sub = grok_auth.add_subparsers(dest="grok_auth_command", required=True)
+    grok_auth_sub.add_parser("status", help="report whether the Nightshift profile has auth material")
+    grok_auth_sub.add_parser("bootstrap", help="copy the minimum Grok auth file into the Nightshift profile")
+
+    safety = sub.add_parser("safety", help="isolation and safety checks")
+    safety_sub = safety.add_subparsers(dest="safety_command", required=True)
+    probe = safety_sub.add_parser("probe", help="run the safety probe; fake unless --provider grok")
+    probe.add_argument("--provider", choices=("fake", "grok"), default="fake")
     return parser
 
 

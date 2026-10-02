@@ -168,6 +168,9 @@ class Job:
     prompt: str
     job_dir: str
     job_file: str
+    isolation: str = "clone"
+    allow_legacy_shell: bool = False
+    verification_steps: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -191,6 +194,9 @@ class Job:
             "prompt": self.prompt,
             "job_dir": self.job_dir,
             "job_file": self.job_file,
+            "isolation": self.isolation,
+            "allow_legacy_shell_verification": self.allow_legacy_shell,
+            "verification_steps": list(self.verification_steps),
         }
 
     @classmethod
@@ -216,6 +222,11 @@ class Job:
             prompt=str(data.get("prompt") or ""),
             job_dir=str(data.get("job_dir") or ""),
             job_file=str(data.get("job_file") or ""),
+            isolation=str(data.get("isolation") or "clone"),
+            allow_legacy_shell=bool(
+                data.get("allow_legacy_shell_verification", data.get("allow_legacy_shell", False))
+            ),
+            verification_steps=list(data.get("verification_steps") or []),
         )
 
 
@@ -263,6 +274,8 @@ class RunRecord:
     source_porcelain: str
     source_porcelain_after: str = ""
     provider_argv: list = field(default_factory=list)
+    source_integrity: str = ""
+    invocation: dict = field(default_factory=dict)
 
 
 def empty_run(**kwargs) -> RunRecord:
@@ -310,6 +323,8 @@ def empty_run(**kwargs) -> RunRecord:
         source_porcelain="",
         source_porcelain_after="",
         provider_argv=[],
+        source_integrity="",
+        invocation={},
     )
     base.update(kwargs)
     return RunRecord(**base)

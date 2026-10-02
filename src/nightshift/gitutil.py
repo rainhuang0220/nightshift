@@ -1,7 +1,9 @@
-"""Read-only git helpers and the one write Nightshift itself performs.
+"""Git helpers.
 
-Nightshift creates a detached worktree. It never stashes, resets, cleans,
-or checks out the source working tree.
+The default workspace write is an independent local clone performed by
+`workspace.py`. The optional worktree backend calls `add_detached_worktree`,
+which registers `.git/worktrees` on the source. Nightshift never stashes,
+resets, cleans, or checks out the source working tree.
 """
 
 from __future__ import annotations

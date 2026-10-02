@@ -40,6 +40,7 @@ class FakeProvider:
             on_pid=on_pid,
             poll_stop=poll_stop,
             heartbeat=heartbeat,
+            containment_profile=request.containment_profile,
         )
 
     def terminate(self, pid: int | None, pgid: int | None = None) -> None:

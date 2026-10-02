@@ -5,22 +5,29 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from nightshift.config import Config
+from nightshift.containment import contained_run, operator_read_denies, sandbox_available, write_profile
 from nightshift.db import Database
+from nightshift.extensions import neutralize_project_extensions, project_instruction_names, run_inspect
+from nightshift.finalize import (
+    BLOCKED_EXTENSION_SURFACE,
+    check_stored_integrity,
+    decide_final,
+    extension_audit_ok,
+)
 from nightshift.gitutil import (
     GIT_BIN,
     changed_files,
     commits_since,
     is_git_repo,
     porcelain,
-    rev_parse,
 )
 from nightshift.guard import write_shims
-from nightshift.job import Job, resolved_repository
+from nightshift.integrity import capture, compare, dumps
+from nightshift.job import Job, resolved_repository, verification_plan
 from nightshift.locks import LockManager, group_key, repo_key, workspace_key
 from nightshift.models import (
     TERMINAL_STATES,
@@ -31,10 +38,12 @@ from nightshift.models import (
     utc_now,
 )
 from nightshift.policy import build_policy, minimal_env, package_pythonpath, scrub_text
+from nightshift.priv import ensure_private_dir, write_private_text
 from nightshift.providers import get_provider
 from nightshift.providers.base import ProviderRequest
-from nightshift.report import ReportInputs, extract_findings, extract_metrics, render_report
-from nightshift.workspace import WorkspaceError, create_worktree, inspect_source
+from nightshift.report import ReportInputs, extract_findings, extract_metrics, render_report, summarize_stream
+from nightshift.runtime import apply_runtime_env, prepare_runtime_dirs
+from nightshift.workspace import WorkspaceError, cleanup_workspace, import_instructions, inspect_source, prepare_workspace
 
 TERMINAL_VALUES = {state.value for state in TERMINAL_STATES}
 REQUIRED_FILES = (
@@ -96,6 +105,7 @@ def execute_run(
             snapshot = inspect_source(repo, job.base_ref)
         except WorkspaceError as exc:
             raise RunBlocked(str(exc)) from exc
+        before_prepare = capture(repo)
         run = db.update_run(
             run_id,
             source_revision=snapshot.revision,
@@ -103,15 +113,57 @@ def execute_run(
             source_porcelain=snapshot.porcelain,
             workspace_path=str(dest),
         )
-        create_worktree(snapshot, dest)
-        checked = porcelain(repo)
-        run = db.update_run(run_id, source_porcelain_after=checked)
+        try:
+            prepare_workspace(snapshot, dest, job.isolation or "clone")
+        except WorkspaceError as exc:
+            raise RunBlocked(str(exc)) from exc
+        prepared = compare(before_prepare, capture(repo))
+        allowed = {"worktrees"} if (job.isolation or "clone") == "worktree" else set()
+        unexpected = [name for name in prepared.changed_categories if name not in allowed]
+        if unexpected:
+            detail = "SOURCE_INTEGRITY_VIOLATION during workspace prepare: " + ",".join(unexpected)
+            raise RunFailed(detail)
+        baseline = capture(repo)
+        neutralized = neutralize_project_extensions(dest, run_dir)
+        instructions = project_instruction_names(dest)
+        run = db.update_run(
+            run_id,
+            source_porcelain_after=porcelain(repo),
+            source_integrity=dumps(baseline),
+        )
         job.repository = str(repo)
         policy = build_policy(job, permission_mode=config.permission_mode)
+        steps = verification_plan(job)
+        if job.provider == "grok" and any(step.get("shell") for step in steps) and not job.allow_legacy_shell:
+            raise RunBlocked(
+                "legacy shell verification is unsafe and is not the default unattended mode"
+            )
+        if not sandbox_available():
+            raise RunBlocked("sandbox-exec is not available; refusing to run unsandboxed")
         prompt_path = run_dir / "prompt.final.md"
-        prompt_path.write_text(policy.preamble + job.prompt.rstrip() + "\n", encoding="utf-8")
+        write_private_text(prompt_path, policy.preamble + job.prompt.rstrip() + "\n")
         session_id = run.session_id or _new_session()
         env = _child_env(config, run_dir, dest, repo, run_id)
+        audit_record = {"ok": True, "violations": [], "counts": {}, "untrusted_instructions": len(instructions)}
+        if job.provider == "grok" and os.environ.get("NIGHTSHIFT_FORBID_GROK") != "1":
+            audit = run_inspect(env, dest)
+            audit_record = audit.to_dict()
+            if not audit.ok:
+                raise RunBlocked(BLOCKED_EXTENSION_SURFACE + ": " + ", ".join(audit.violations))
+        elif job.provider == "grok":
+            raise RunBlocked("refusing to launch grok because NIGHTSHIFT_FORBID_GROK=1")
+        invocation = _invocation(
+            job,
+            policy,
+            session_id=session_id,
+            config=config,
+            isolation=job.isolation or "clone",
+            neutralized=neutralized,
+            audit=audit_record,
+            instructions=instructions,
+        )
+        db.update_run(run_id, invocation=invocation)
+        profile = _provider_profile(config, run_dir, dest, network=job.provider == "grok")
         _write_metadata(run_dir, db.require_run(run_id))
         run = db.transition(
             run_id,
@@ -133,6 +185,7 @@ def execute_run(
             session_id=session_id,
             model=job.model,
             max_turns=config.max_turns,
+            containment_profile=profile,
         )
         if run.provider == "grok":
             argv = provider.build_argv(request, policy)
@@ -183,46 +236,48 @@ def execute_run(
         )
         db.transition(run_id, RunState.VERIFYING.value, "verifying")
         ver_code, ver_text = run_verification(
-            job.verification,
+            steps,
             cwd=dest,
             env=env,
             log_path=run_dir / "verification.log",
             timeout=float(job.max_runtime_seconds),
+            profile=_verification_profile(config, run_dir, dest),
         )
+        del ver_text
         db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
-        source_changed, source_detail = _source_changed(repo, snapshot.head, snapshot.porcelain)
-        if source_changed:
+        try:
             db.update_run(run_id, source_porcelain_after=porcelain(repo))
-        reason = ""
-        final = RunState.SUCCEEDED.value
-        if source_changed:
-            final = RunState.FAILED.value
-            reason = "source repository changed during the run; Nightshift did not try to revert it"
-        elif result.exit_code != 0:
-            final = RunState.FAILED.value
-            reason = result.failure_reason or f"provider exited {result.exit_code}"
-        elif ver_code != 0:
-            final = RunState.FAILED.value
-            reason = f"verification failed with exit {ver_code}"
+        except Exception:
+            pass
+        current = db.require_run(run_id)
+        integrity = check_stored_integrity(current.source_repo, current.source_integrity)
+        decision = decide_final(
+            provider_exit_code=result.exit_code,
+            verification_ran=True,
+            verification_exit_code=ver_code,
+            workspace_exists=dest.exists(),
+            integrity_ok=integrity.ok,
+            safety_audit_ok=extension_audit_ok(current.provider, current.invocation),
+            integrity_detail=integrity.detail,
+        )
         uncertainty = []
-        if source_detail and source_changed:
-            uncertainty.append(source_detail)
-        if result.failure_reason and result.failure_reason not in reason:
+        if not integrity.ok and integrity.detail:
+            uncertainty.append(integrity.detail + "; Nightshift did not restore the source")
+        if result.failure_reason and result.failure_reason not in decision.reason:
             uncertainty.append(result.failure_reason)
-        code = exit_code_for_state(final)
         ended = utc_now()
-        started = db.require_run(run_id).started_at
+        started = current.started_at
         db.transition(
             run_id,
-            final,
-            reason or "finished",
-            failure_reason=reason,
-            exit_code=code,
+            decision.state,
+            decision.reason or "finished",
+            failure_reason=decision.reason,
+            exit_code=exit_code_for_state(decision.state),
             ended_at=ended,
             duration_seconds=_duration(started, ended),
         )
         publish_report(config, db, run_id, extra_uncertainty=uncertainty)
-        _maybe_remove_worktree(config, repo, dest, final)
+        _maybe_remove_worktree(config, repo, dest, decision.state, job.isolation or "clone")
         return db.require_run(run_id)
     except RunBlocked as exc:
         _settle(db, run_id, RunState.BLOCKED.value, str(exc))
@@ -258,34 +313,44 @@ def run_verification_only(config: Config, db: Database, run_id: str) -> RunRecor
         db.transition(run_id, RunState.VERIFYING.value, "recover: verification never ran")
     source = Path(run.source_repo) if run.source_repo else workspace
     env = _child_env(config, run_dir, workspace, source, run_id)
+    if not sandbox_available():
+        _settle(db, run_id, RunState.FAILED.value, "sandbox-exec is not available; refusing to run unsandboxed")
+        publish_report(config, db, run_id)
+        return db.require_run(run_id)
     ver_code, _text = run_verification(
-        job.verification,
+        verification_plan(job),
         cwd=workspace,
         env=env,
         log_path=run_dir / "verification.log",
         timeout=float(job.max_runtime_seconds or run.max_runtime_seconds or 600),
+        profile=_verification_profile(config, run_dir, workspace),
     )
-    final = RunState.SUCCEEDED.value if ver_code == 0 and (run.provider_exit_code in (None, 0)) else RunState.FAILED.value
-    if run.provider_exit_code not in (None, 0):
-        final = RunState.FAILED.value
-    reason = "" if final == RunState.SUCCEEDED.value else f"verification exit {ver_code}"
-    if run.provider_exit_code not in (None, 0) and not reason:
-        reason = f"provider exited {run.provider_exit_code}"
-    ended = utc_now()
     db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
     current = db.require_run(run_id)
+    integrity = check_stored_integrity(current.source_repo, current.source_integrity)
+    decision = decide_final(
+        provider_exit_code=current.provider_exit_code,
+        verification_ran=True,
+        verification_exit_code=ver_code,
+        workspace_exists=workspace.exists(),
+        integrity_ok=integrity.ok,
+        safety_audit_ok=extension_audit_ok(current.provider, current.invocation),
+        integrity_detail=integrity.detail,
+    )
     if current.state not in TERMINAL_VALUES:
+        ended = utc_now()
         db.transition(
             run_id,
-            final,
-            "verification finished during recover",
-            failure_reason=reason,
-            exit_code=exit_code_for_state(final),
+            decision.state,
+            decision.reason or "verification finished during recover",
+            failure_reason=decision.reason,
+            exit_code=exit_code_for_state(decision.state),
             ended_at=ended,
             duration_seconds=_duration(current.started_at, ended),
             recovery_class=current.recovery_class or "verification_never_ran",
         )
-    publish_report(config, db, run_id)
+    uncertainty = [integrity.detail] if not integrity.ok and integrity.detail else None
+    publish_report(config, db, run_id, extra_uncertainty=uncertainty)
     return db.require_run(run_id)
 
 
@@ -305,10 +370,12 @@ def publish_report(
     _ensure_run_files(run_dir)
     stdout = _read(run_dir / "provider.stdout.log")
     stderr = _read(run_dir / "provider.stderr.log")
-    findings = extract_findings(stdout)
+    summary = summarize_stream(stdout)
+    findings = extract_findings(summary or stdout)
     if run.state != RunState.SUCCEEDED.value and stderr.strip():
-        extra = stderr.strip()[-1000:]
-        findings = f"{findings}\n{extra}".strip() if findings else extra
+        uncertainty_note = "Provider stderr was captured in the private log and omitted from this report."
+    else:
+        uncertainty_note = ""
     commits: list[str] = []
     files: list[str] = []
     workspace = Path(run.workspace_path) if run.workspace_path else None
@@ -324,11 +391,13 @@ def publish_report(
             else:
                 missing.append(relative)
     uncertainty = list(extra_uncertainty or [])
-    blob = stdout + "\n" + stderr
+    if uncertainty_note:
+        uncertainty.append(uncertainty_note)
+    blob = summary + "\n" + stdout
     for needle in SUSPICIOUS:
         if needle in blob:
             uncertainty.append(
-                f"Provider output mentioned {needle!r}. The PATH shim may still have blocked it."
+                f"Provider output mentioned {needle!r}. Command-name guards are not containment."
             )
     if missing:
         uncertainty.append("Expected artifacts missing: " + ", ".join(missing))
@@ -367,10 +436,12 @@ def publish_report(
         artifacts_found=found,
         human_review_required=True,
         recovery_class=run.recovery_class,
+        isolation=str((run.invocation or {}).get("isolation") or job.isolation or "clone"),
+        import_note=import_instructions(str((run.invocation or {}).get("isolation") or job.isolation or "clone")),
     )
     text = render_report(info)
     report_path = run_dir / "report.md"
-    report_path.write_text(text, encoding="utf-8")
+    write_private_text(report_path, text)
     db.update_run(run_id, report_path=str(report_path), artifact_paths=found, run_dir=str(run_dir))
     _write_metadata(run_dir, db.require_run(run_id))
     _emit(db, run_dir, run_id, "report", f"report {run.state}", run.state)
@@ -378,45 +449,46 @@ def publish_report(
 
 
 def run_verification(
-    commands: list[str],
+    steps: list[dict],
     *,
     cwd: Path,
     env: dict[str, str],
     log_path: Path,
     timeout: float,
+    profile: Path | None = None,
 ) -> tuple[int, str]:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    if not commands:
-        log_path.write_text("no verification commands\n", encoding="utf-8")
+    """Run structured argv steps inside the workspace seatbelt.
+
+    Legacy shell steps are labeled and still confined. They are not the
+    default unattended mode for Grok jobs.
+    """
+    ensure_private_dir(log_path.parent)
+    if not steps:
+        write_private_text(log_path, "no verification commands\n")
         return 0, "no verification commands\n"
+    if profile is None:
+        return 127, "verification refused without a seatbelt profile\n"
     rc = 0
-    chunks = []
-    with log_path.open("a", encoding="utf-8") as handle:
-        for command in commands:
-            handle.write(f"$ {command}\n")
-            handle.flush()
-            try:
-                proc = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=str(cwd),
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
-                handle.write((exc.stdout or "") if isinstance(exc.stdout, str) else "")
-                handle.write("verification timed out\n")
-                chunks.append("verification timed out\n")
-                rc = 124
-                continue
-            handle.write(proc.stdout or "")
-            handle.write(proc.stderr or "")
-            handle.write(f"exit {proc.returncode}\n")
-            chunks.append((proc.stdout or "") + (proc.stderr or ""))
-            if proc.returncode != 0 and rc == 0:
-                rc = proc.returncode
+    chunks: list[str] = []
+    parts: list[str] = []
+    for step in steps:
+        argv = [str(item) for item in step.get("argv") or []]
+        display = str(step.get("display") or " ".join(argv))
+        step_timeout = float(step.get("timeout_seconds") or timeout)
+        label = "legacy shell verification; confined by seatbelt" if step.get("shell") else "argv verification"
+        code, output = contained_run(
+            argv,
+            cwd=cwd,
+            env=env,
+            profile=profile,
+            timeout=step_timeout,
+        )
+        block = f"$ {display}\n# {label}\n{output}exit {code}\n"
+        parts.append(block)
+        chunks.append(output)
+        if code != 0 and rc == 0:
+            rc = code
+    write_private_text(log_path, "".join(parts))
     return rc, "".join(chunks)
 
 
@@ -469,11 +541,11 @@ def _workspace_dest(config: Config, run: RunRecord) -> Path:
 
 
 def _ensure_run_files(run_dir: Path) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(run_dir)
     for name in REQUIRED_FILES:
         path = run_dir / name
         if not path.exists():
-            path.write_text("{}\n" if name == "metadata.json" else "", encoding="utf-8")
+            write_private_text(path, "{}\n" if name == "metadata.json" else "")
 
 
 def _emit(db: Database, run_dir: Path, run_id: str, kind: str, message: str, state: str | None) -> None:
@@ -481,7 +553,9 @@ def _emit(db: Database, run_dir: Path, run_id: str, kind: str, message: str, sta
     db.add_event(run_id, kind, safe, state)
     path = run_dir / "events.jsonl"
     line = json.dumps({"ts": utc_now(), "kind": kind, "state": state, "message": safe})
-    with path.open("a", encoding="utf-8") as handle:
+    from nightshift.priv import open_private
+
+    with open_private(path, append=True) as handle:
         handle.write(line + "\n")
         handle.flush()
 
@@ -511,16 +585,22 @@ def _write_metadata(run_dir: Path, run: RunRecord) -> None:
         "host": run.host_info,
         "recovery_class": run.recovery_class,
         "report_path": run.report_path,
+        "invocation": run.invocation or {},
     }
-    (run_dir / "metadata.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private_text(
+        run_dir / "metadata.json",
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run_id: str) -> dict[str, str]:
-    del config, run_id
+    del run_id
     bin_dir = run_dir / "bin"
     hooks = run_dir / "empty-hooks"
     gitconfig = run_dir / "empty-gitconfig"
-    gitconfig.write_text("", encoding="utf-8")
+    write_private_text(gitconfig, "")
+    profile = config.grok_profile()
+    runtime_home, private_tmp = prepare_runtime_dirs(run_dir, profile)
     real = {
         "git": shutil.which(GIT_BIN) or shutil.which("git") or "",
         "gh": shutil.which("gh") or "",
@@ -554,33 +634,84 @@ def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run
     for tool, binary in real.items():
         if binary:
             extra[f"NIGHTSHIFT_REAL_{tool.upper()}"] = binary
-    return minimal_env(parent, extra=extra)
+    env = minimal_env(parent, extra=extra)
+    return apply_runtime_env(env, runtime_home=runtime_home, grok_home=profile, private_tmp=private_tmp)
 
 
-def _source_changed(repo: Path, head: str, tree: str) -> tuple[bool, str]:
+def _provider_profile(config: Config, run_dir: Path, workspace: Path, *, network: bool) -> Path:
+    writable = [workspace, run_dir, config.grok_profile()]
+    return write_profile(
+        run_dir / "provider.sb",
+        writable=writable,
+        network=network,
+        read_deny=operator_read_denies(Path.home()),
+    )
+
+
+def _verification_profile(config: Config, run_dir: Path, workspace: Path) -> Path:
+    del config
+    return write_profile(
+        run_dir / "verification.sb",
+        writable=[workspace, run_dir],
+        network=False,
+        read_deny=operator_read_denies(Path.home()),
+    )
+
+
+def _invocation(
+    job: JobModel,
+    policy,
+    *,
+    session_id: str,
+    config: Config,
+    isolation: str,
+    neutralized: list[str],
+    audit: dict,
+    instructions: list[str],
+) -> dict:
+    version = ""
+    if job.provider == "grok" and os.environ.get("NIGHTSHIFT_FORBID_GROK") != "1":
+        version = _grok_version()
+    return {
+        "binary_version": version,
+        "model": job.model or "",
+        "session_id": session_id,
+        "permission_mode": policy.permission_mode,
+        "sandbox_profile": policy.sandbox_profile,
+        "seatbelt": "deny-default",
+        "max_turns": config.max_turns,
+        "memory_disabled": True,
+        "subagents_disabled": True,
+        "web_search_disabled": bool(policy.disable_web_search),
+        "deny_count": len(policy.deny),
+        "allow_count": len(policy.allow),
+        "grok_home": "state/grok-profile",
+        "isolation": isolation,
+        "neutralized": list(neutralized),
+        "untrusted_instructions": list(instructions),
+        "extension_audit": audit,
+        "legacy_shell": bool(job.allow_legacy_shell),
+    }
+
+
+def _grok_version() -> str:
+    import subprocess
+
     try:
-        new_head = rev_parse(repo, "HEAD")
-        new_tree = porcelain(repo)
-    except Exception as exc:
-        return True, f"could not re-read the source repository: {exc}"
-    if new_head != head or new_tree != tree:
-        return True, "source HEAD or working tree differs from the pre-run snapshot"
-    return False, ""
+        proc = subprocess.run(["grok", "--version"], check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or proc.stderr or "").splitlines()[0] if proc.returncode == 0 else ""
 
 
-def _maybe_remove_worktree(config: Config, source: Path, dest: Path, state: str) -> None:
+def _maybe_remove_worktree(config: Config, source: Path, dest: Path, state: str, isolation: str) -> None:
     if not config.destroy_failed_worktrees:
         return
     if state not in {RunState.FAILED.value, RunState.CANCELLED.value}:
         return
     if not dest.exists():
         return
-    subprocess.run(
-        [GIT_BIN, "-C", str(source), "worktree", "remove", "--force", str(dest)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    cleanup_workspace(isolation, source, dest)
 
 
 def _new_session() -> str:

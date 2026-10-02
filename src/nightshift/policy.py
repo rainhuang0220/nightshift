@@ -1,8 +1,10 @@
 """Default overnight policy: deny rules, allow rules, and the advisory preamble.
 
 The preamble is an instruction to the model. It is not a security boundary.
-Enforcement that Nightshift itself can guarantee lives in the worktree, the
-PATH shim, environment minimization, and the post-run source audit.
+Allow rules are Grok tool-call filters. They are not filesystem containment.
+The PATH shim is defense in depth. It is not the principal boundary.
+Filesystem containment is the seatbelt profile. Source protection is the
+independent clone plus the integrity gate. Human review is the final approval.
 """
 
 from __future__ import annotations
@@ -77,6 +79,8 @@ READ_ALLOW: tuple[str, ...] = (
     "Bash(find*)",
 )
 
+# Name allowlists are defense in depth. An allowed interpreter can still call
+# absolute binaries. Filesystem containment is the seatbelt profile.
 WORKSPACE_WRITE_ALLOW: tuple[str, ...] = (
     "Edit",
     "Write",
@@ -108,6 +112,7 @@ NETWORK_ALLOW: tuple[str, ...] = (
 )
 
 SECRET_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|PASSWD|SESSION)", re.I)
+_DROPPED_PREFIXES = ("AWS_", "AZURE_", "GOOGLE_", "KAGGLE_", "NPM_", "PYPI_", "GH_", "GITHUB_")
 
 _KEPT_ENV = (
     "PATH",
@@ -159,8 +164,8 @@ def build_policy(job: Job, *, permission_mode: str = "dontAsk") -> Policy:
         allow = allow + NETWORK_ALLOW
     deny = DENY_RULES
     if job.write_scope == "workspace" and job.repository:
-        # Extra Grok-level denies for the source checkout. The worktree is a
-        # different path, so edits there still match the Edit allow rule.
+        # Extra Grok-level denies for the source checkout. These are tool-call
+        # filters. The isolated clone and the seatbelt are the containment.
         repo = str(Path(job.repository).expanduser())
         deny = deny + (
             f"Edit({repo}/**)",
@@ -188,7 +193,8 @@ def render_preamble(job: Job) -> str:
             "# Nightshift policy",
             "",
             "This preamble is an instruction. It is not a security boundary.",
-            "Nightshift runs you inside an isolated git worktree. The original",
+            "Permission rules are not filesystem containment.",
+            "Nightshift runs you inside an isolated workspace. The original",
             "checkout is off limits.",
             "",
             writes,
@@ -216,19 +222,26 @@ def render_preamble(job: Job) -> str:
     )
 
 
+def _sensitive_name(name: str) -> bool:
+    if SECRET_ENV_RE.search(name):
+        return True
+    upper = name.upper()
+    return upper.startswith(_DROPPED_PREFIXES)
+
+
 def minimal_env(parent: dict[str, str], *, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Child environment with secret-looking variables removed.
 
-    HOME is kept because Grok and git need a home directory. The caller
-    redirects GIT_CONFIG_GLOBAL at an empty file so the child cannot change
-    the operator's global git config through git itself.
+    HOME stays in the whitelist so callers can supply a directory. The runner
+    replaces it with an isolated runtime home before a provider starts. This
+    function is not the extension-isolation boundary.
     """
     kept: dict[str, str] = {}
     for name in _KEPT_ENV:
-        if name in parent and not SECRET_ENV_RE.search(name):
+        if name in parent and not _sensitive_name(name):
             kept[name] = parent[name]
     for name, value in (extra or {}).items():
-        if SECRET_ENV_RE.search(name):
+        if _sensitive_name(name):
             continue
         if "\n" in name or "\x00" in name:
             continue
@@ -237,8 +250,16 @@ def minimal_env(parent: dict[str, str], *, extra: dict[str, str] | None = None) 
 
 
 def scrub_text(text: str) -> str:
-    """Best-effort redaction for logs. Not a guarantee against every secret shape."""
-    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    """Best-effort redaction for logs. Not a cryptographic guarantee.
+
+    Arbitrary repository content can contain secret formats this pattern does
+    not recognize. Logs stay on disk; they are not deleted after redaction.
+    """
+    text = re.sub(
+        r"(?i)([\"']?(?:api[_-]?key|token|secret|password|authorization)[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|\S+)",
+        r"\1[redacted]",
+        text,
+    )
     return text
 
 

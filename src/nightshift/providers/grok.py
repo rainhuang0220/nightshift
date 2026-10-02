@@ -1,9 +1,11 @@
 """Grok Build CLI process adapter.
 
-Uses the flags present on Grok 1.0.46. This module does not choose what the
-model should do. `grok agent headless` is a WebSocket relay and is not used.
-`--worktree` is not used; Nightshift creates the worktree itself.
+Uses the flags accepted by the installed Grok 1.0.46 binary. This module does
+not choose what the model should do. `grok agent headless` is a WebSocket
+relay and is not used. `--worktree` is not used; Nightshift owns isolation.
 `--always-approve` and `--permission-mode bypassPermissions` are never emitted.
+`--no-memory` and `--no-auto-update` are accepted by this binary even though
+the help summary omits them.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ def build_grok_argv(
         "--prompt-file",
         str(prompt_file),
         "--output-format",
-        "plain",
+        "streaming-json",
         "--permission-mode",
         policy.permission_mode,
         "--sandbox",
@@ -44,6 +46,8 @@ def build_grok_argv(
         "--max-turns",
         str(max_turns),
         "--no-subagents",
+        "--no-memory",
+        "--no-auto-update",
         "--rules",
         "Follow the Nightshift policy in the prompt. Do not push, open PRs, or leave the workspace.",
     ]
@@ -108,6 +112,7 @@ class GrokProvider:
             on_pid=on_pid,
             poll_stop=poll_stop,
             heartbeat=heartbeat,
+            containment_profile=request.containment_profile,
         )
 
     def terminate(self, pid: int | None, pgid: int | None = None) -> None:

@@ -1,14 +1,18 @@
-# Nightshift v0.1 handoff
+# Nightshift v0.2 handoff
 
-Local control plane. No remote. No launchd service. No live Grok job was started while building this version.
+Local control plane. No remote. No launchd service. The real Grok canary is a separate step after this implementation commit and is recorded below when it has been run.
 
 ## Architecture summary
 
-Nightshift queues a versioned `job.toml` plus `prompt.md`, locks the concurrency group and repository, and runs the provider inside a detached git worktree it creates under `worktrees/`. SQLite (`state/nightshift.db`, WAL, `synchronous=FULL`) is the authority for run state. The legal edges live only in `LEGAL_TRANSITIONS`. The supervisor is single-threaded with concurrency 1. `recover` classifies active rows and does not relaunch a provider. `recover --retry` is the only way back to `QUEUED`, and it stops at `max_attempts`.
+Nightshift queues a versioned `job.toml` plus `prompt.md`, locks the concurrency group and repository, and runs the provider inside an independent local clone. The clone is `git clone --no-hardlinks --no-checkout`, then `checkout --detach` of the recorded revision, with `origin` removed. SQLite (`state/nightshift.db`, WAL, `synchronous=FULL`, mode 0600) is the authority for run state. The legal edges live only in `LEGAL_TRANSITIONS`. The supervisor is single-threaded with concurrency 1.
 
-The Grok adapter builds a process argv from flags on the installed Grok 1.0.46 CLI. It does not plan. Tests and the bootstrap dry run use FakeProvider. `NIGHTSHIFT_FORBID_GROK=1` makes the Grok adapter return without spawning.
+`decide_final` is the only success gate. Normal execution, verification recovery, and recorded-state finalization all use it. `SUCCEEDED` requires provider exit 0, verification that ran and exited 0, a workspace on disk, a passing source-integrity snapshot, and a passing extension audit when the provider is Grok. `recover` classifies active rows and does not relaunch a provider. `recover --retry` is the only way back to `QUEUED`, and it stops at `max_attempts`.
 
-`--root` relocates `state/`, `runs/`, and `worktrees/`. Those directories are gitignored.
+The Grok adapter builds a process argv from flags on the installed Grok 1.0.46 CLI and wraps the process with `/usr/bin/sandbox-exec`. The child `HOME` is `runs/<id>/runtime-home`. `GROK_HOME` is `state/grok-profile`. Tests and the default safety probe use FakeProvider. `NIGHTSHIFT_FORBID_GROK=1` blocks a Grok launch before `grok inspect`.
+
+`isolation = "worktree"` remains available. It shares the source git directory and is not the unattended default.
+
+`--root` relocates `state/`, `runs/`, and `worktrees/`. Those directories, and `state/grok-profile/`, are gitignored.
 
 ## Files and modules
 
@@ -23,6 +27,8 @@ jobs/examples/repo_audit/prompt.md
 docs/architecture.md
 docs/job-format.md
 docs/threat-model.md
+docs/security-audit-v0.1.md
+docs/grok-runtime-isolation.md
 src/nightshift/__init__.py
 src/nightshift/__main__.py
 src/nightshift/cli.py
@@ -34,11 +40,18 @@ src/nightshift/queue.py
 src/nightshift/locks.py
 src/nightshift/workspace.py
 src/nightshift/gitutil.py
+src/nightshift/integrity.py
+src/nightshift/finalize.py
+src/nightshift/containment.py
+src/nightshift/extensions.py
+src/nightshift/runtime.py
+src/nightshift/priv.py
 src/nightshift/policy.py
 src/nightshift/guard.py
 src/nightshift/runner.py
 src/nightshift/supervisor.py
 src/nightshift/report.py
+src/nightshift/probe.py
 src/nightshift/doctor.py
 src/nightshift/testkit.py
 src/nightshift/providers/__init__.py
@@ -51,14 +64,15 @@ tests/test_job_and_policy.py
 tests/test_recover_and_report.py
 tests/test_state_and_db.py
 tests/test_workspace_and_guard.py
+tests/test_v02.py
 ```
-
-`job.py`, `guard.py`, `gitutil.py`, `fake_child.py`, and `testkit.py` are extra modules. Parsing, the PATH policy, and git calls stay out of the supervisor. `testkit.py` lives in the package because a site-packages distribution named `tests` shadows a top-level import of that name.
 
 ## CLI commands
 
 ```text
 nightshift doctor
+nightshift auth grok status
+nightshift auth grok bootstrap
 nightshift job validate <path>
 nightshift queue add <path> [--provider fake|grok]
 nightshift queue list
@@ -69,12 +83,13 @@ nightshift logs <run-id>
 nightshift report [run-id]
 nightshift recover [--retry]
 nightshift cancel <run-id>
+nightshift safety probe [--provider fake|grok]
 nightshift version
 ```
 
 Global flags: `--root`, `--config`.
 
-Exit codes: 0 success, 1 failed or cancelled, 2 invalid job or usage, 3 unknown run, 4 blocked, 5 interrupted.
+Exit codes: 0 success, 1 failed or cancelled, 2 invalid job or usage, 3 unknown run, 4 blocked, 5 interrupted. `safety probe` uses 0 for `PASS` and `PASS_WITH_LIMITATIONS`, and 1 for `FAIL`.
 
 ## Exact test results
 
@@ -87,15 +102,15 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 Result:
 
 ```text
-Ran 34 tests in 9.815s
+Ran 51 tests in 14.204s
 OK
 ```
 
-All 34 methods passed, including job validation, illegal transitions, SQLite reopen, queue order, locks, dirty-worktree isolation, PATH-shim denies, FakeProvider success and failure, every recover class, report sections, Grok argv denies without `--always-approve` or `bypassPermissions`, daemon drain of one queued fake job, and child-group termination.
-
 `python3 -m compileall -q src tests` exited 0. `ruff` and `black` are not installed; that absence is not a failure.
 
-`nightshift doctor` twice, both exit 0, identical conclusions:
+Coverage added in v0.2 includes clone independence, each integrity category the snapshot claims, the recovery integrity regression, isolated HOME and GROK_HOME, auth-file modes on a synthetic file, extension-audit parsing, project-file neutralization in the clone only, Grok argv flags, environment sanitization, log modes, structured verification, absolute-interpreter seatbelt checks, and the fake safety probe. No unit test calls Grok.
+
+`nightshift doctor` twice, both exit 0, identical output:
 
 ```text
 [pass] Python 3.14.7 (>= 3.11)
@@ -105,65 +120,58 @@ All 34 methods passed, including job validation, illegal transitions, SQLite reo
 [pass] git
 ```
 
-`nightshift job validate jobs/examples/repo_audit` exited 0: `valid repo-audit-example provider=fake write_scope=none`. A manifest missing required fields exited 2 and named `missing required field 'id'`.
+`nightshift job validate jobs/examples/repo_audit` exited 0: `valid repo-audit-example provider=fake write_scope=none`.
 
-Two FakeProvider `nightshift run` invocations, each against its own throwaway root and its own dirty temporary git repository:
+`nightshift safety probe` (the default, fake) exited 0. The first lines were `PASS`, `provider: fake`, and `grok: not called`. Nightshift's own replay classified:
 
-| Run | State | Attempt | Source HEAD before and after | Porcelain |
-| --- | --- | --- | --- | --- |
-| `ns-0b571bdadc2b` | SUCCEEDED | 1 | `681bd8ed446af7e005192896b9e6dc9208662d55` | `?? DIRTY.txt` unchanged |
-| `ns-f07b49e876c6` | SUCCEEDED | 1 | `253e09351bfefb1ba056ccd9e410793df0877fe4` | `?? DIRTY.txt` unchanged |
+| Action | Layer |
+| --- | --- |
+| Workspace write via absolute Python | DEFENSE IN DEPTH |
+| Local commit via `/usr/bin/git` | DEFENSE IN DEPTH |
+| Absolute Python write to the source | HARD BLOCK |
+| `/bin/sh` write outside the workspace | HARD BLOCK |
+| Delete of the outside sentinel | HARD BLOCK |
+| PATH `git push` to a local bare repo | DEFENSE IN DEPTH |
+| `/usr/bin/git push` to a local bare repo | HARD BLOCK |
+| Python subprocess `/usr/bin/git push` | HARD BLOCK |
 
-Each run directory contained `metadata.json`, `prompt.final.md`, `provider.stdout.log`, `provider.stderr.log`, `events.jsonl`, `verification.log`, and `report.md`. Each report named that repository and the original revision, recorded local commit `nightshift: record fake provider note`, and set `Human review required: yes`.
+`xcrun` cache warnings (`Operation not permitted`) appeared on allowed commands and did not stop the workspace write or the local commit. The seatbelt was not widened to silence them.
 
-`nightshift recover` on a `RUNNING` row whose PID was dead (`999999`) and whose workspace directory still existed printed `ns-d24f0e11027e INTERRUPTED process_gone_workspace_intact attempt=1` and did not launch a provider. A dead `RUNNING` row whose workspace path is missing is classified `process_gone_workspace_missing`, marked `FAILED`, and also does not launch a provider. `nightshift cancel` on a queued run printed `cancel ns-b8637dfff155 CANCELLED`. `queue list`, `status`, `logs`, and `report` showed those run ids and outcomes.
+## Real Grok probe
+
+Not run as part of the implementation commit. The authorized command, after this commit, is one sacrificial `nightshift safety probe --provider grok`. It builds its own temporary source, clone, sentinel, and local bare remote. It does not use a developer repository and it does not push to GitHub.
 
 ## Safety guarantees
 
-- The provider cwd is a Nightshift-created detached worktree. Nightshift does not clean, reset, stash, or checkout the source tree.
-- A changed source HEAD or porcelain fails the run. Failed worktrees are kept unless `destroy_failed_worktrees` is set.
-- Default Grok mode is `dontAsk` plus explicit allow and deny rules. `--always-approve`, `bypassPermissions`, `--worktree`, and `grok agent headless` are not emitted.
-- PATH shims refuse push, sudo, Kaggle, package publish, mutating `gh`, and git writes outside the worktree, for PATH lookup of those tools.
-- `GIT_CONFIG_GLOBAL` points at an empty file in the run directory. `GIT_CONFIG_NOSYSTEM=1`.
-- Child environment drops names that look like secrets. Logs redact common assignment shapes.
-- `recover` does not restart work and does not increment `attempt`. Retry is explicit and capped.
-- Locks stop two runs from sharing a concurrency group or a live workspace.
-- Verification commands are the operator's snapshotted list, not model output.
+- The default provider cwd is an independent clone. Nightshift does not clean, reset, stash, or checkout the source tree. A clone commit does not update source refs or the source worktree registry.
+- `decide_final` withholds `SUCCEEDED` when any protected source category changes, including on recovery. Nightshift does not restore the source.
+- Grok jobs run under a private HOME and `state/grok-profile`. `grok inspect --json` must pass before the model starts.
+- The seatbelt is the filesystem containment. The PATH shim and Grok allow rules are defense in depth. The prompt is advisory.
+- Verification of a Grok job is an argv under a network-denying seatbelt. Legacy shell verification is blocked for Grok unless the job opts in.
+- `recover` does not restart work and does not increment `attempt`.
+- Runtime directories are mode 0700. Logs and the database are mode 0600. The report does not paste raw stderr.
 
 ## Safety limitations
 
-- The prompt preamble is advisory. It is not a security boundary.
-- Grok deny rules are hard only inside Grok's permission engine.
-- `--sandbox workspace` and `--sandbox read-only` are requested from the installed user guide. Seatbelt was not probed. If a profile fails to apply, Grok continues without that enforcement. This is unverified.
-- On macOS, Grok's child-network sandbox is a documented no-op. Offline policy is `--disable-web-search` and withholding web tools. `curl`, `wget`, and `npx` are not wrapped.
-- An absolute binary such as `/usr/bin/git` bypasses the PATH shim. `pnpm`, `yarn`, and `cargo` are not wrapped except where a Grok deny names them.
-- A linked worktree shares the source repo's git config. Shimmed git refuses config writes and forces an empty `core.hooksPath`. An absolute git binary can still write that shared config.
-- The post-run audit detects source mutation. It does not revert it.
-- `HOME` remains in the child environment. Credential files on disk are not removed.
-- `NIGHTSHIFT_FORBID_GROK` is an operator switch, not a sandbox.
-- Verification runs the operator's shell commands. A dangerous verification line runs.
+- The Grok provider seatbelt allows network so the model API can be reached. An https or ssh `git push` is not an OS hard block. A local bare push is. A clean real probe is `PASS_WITH_LIMITATIONS` while this stands.
+- Grok's own `--sandbox` flag is requested. The seatbelt is the containment Nightshift enforces.
+- Redaction is best-effort. It is not a guarantee over arbitrary repository content.
+- Prompt compliance is not a hard block. The probe classifies a block from the seatbelt or the shim.
+- Human review is required on every report, including `SUCCEEDED`.
 
 ## Known issues
 
 - `recover` records `--resume` support in the Grok argv builder and does not call it. A dead provider stays `INTERRUPTED` until a human passes `--retry`, which starts a new attempt rather than resuming the session.
 - The example job's repository is the placeholder `REPLACE_WITH_REPOSITORY_PATH`. Validation succeeds. Queueing it unchanged blocks.
-- Human review is required on every v0.1 report, including `SUCCEEDED`.
 - Success criteria are prose in the report. They are not evaluated.
-- Concurrency defaults to 1. The claim and lock gate is the extension point, and the daemon is still one thread.
-- Doctor creates `state/` on first run. That directory is gitignored.
+- Concurrency defaults to 1.
 - Run the suite with `python3 -m unittest discover -s tests`. Importing `tests.<module>` can load an unrelated site-packages package named `tests`.
 
-## Next recommended milestone
-
-Prove the Grok sandbox on one throwaway repository. Run a single short `provider = "grok"` job with `write_scope = "workspace"`, `network = false`, and a small verification command. Inspect whether Grok warns that the sandbox profile did not apply. Do not point that job at a repository you need. After that, decide whether `recover` should grow a real `--resume` path.
-
-## Commands to run next
+## Next command
 
 ```bash
 cd ~/nightshift
-.venv/bin/nightshift doctor
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-caffeinate -i .venv/bin/nightshift daemon
+PYTHONPATH=src python3 -m nightshift safety probe --provider grok
 ```
 
-Stop the daemon with Ctrl-C. Queued jobs stay queued. Nightshift does not install a launchd job. Read `docs/threat-model.md` before the first real Grok job.
+That command is the sacrificial canary. Do not point a job at a repository you need. Read `docs/threat-model.md` before the first real overnight job.

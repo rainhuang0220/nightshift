@@ -7,6 +7,7 @@ from pathlib import Path
 from nightshift.config import load_config
 from nightshift.db import Database
 from nightshift.locks import LockManager
+from nightshift.integrity import capture, dumps
 from nightshift.models import RunState, empty_run
 from nightshift.providers.fake import FakeProvider
 from nightshift.providers.base import ProviderRequest
@@ -337,6 +338,7 @@ class RecoverTests(unittest.TestCase):
                     run_dir=str(config.runs_dir / "pending"),
                     source_head="unused",
                     base_ref="HEAD",
+                    source_integrity=dumps(capture(verify_ws)),
                 )
             )
             updated, applied = recover_run(config, db, locks, pending.run_id)
@@ -367,10 +369,83 @@ class RecoverTests(unittest.TestCase):
             self.assertEqual(updated.state, RunState.SUCCEEDED.value)
             self.assertEqual(updated.attempt, 1)
 
+            tainted = root / "tainted-ws"
+            make_repo(tainted)
+            (tainted / "marker.txt").write_text("ok\n", encoding="utf-8")
+            tainted_run = db.insert_run(
+                empty_run(
+                    job_id="tainted",
+                    provider="fake",
+                    state=RunState.VERIFYING.value,
+                    attempt=1,
+                    max_attempts=2,
+                    provider_exit_code=0,
+                    verification_exit_code=0,
+                    verification_ran=True,
+                    job_snapshot=_job_snapshot(["test -f marker.txt"]),
+                    workspace_path=str(tainted),
+                    source_repo=str(tainted),
+                    source_revision="unused",
+                    run_dir=str(config.runs_dir / "tainted"),
+                    source_head="unused",
+                    base_ref="HEAD",
+                    source_integrity=dumps(capture(tainted)),
+                )
+            )
+            subprocess.check_call(["git", "-C", str(tainted), "config", "--local", "nightshift.tainted", "1"])
+            updated, applied = recover_run(config, db, locks, tainted_run.run_id)
+            self.assertEqual(applied.classification, "provider_exited")
+            self.assertFalse(applied.launch_provider)
+            self.assertNotEqual(updated.state, RunState.SUCCEEDED.value)
+            self.assertIn("SOURCE_INTEGRITY_VIOLATION", updated.failure_reason)
+
             queued = db.insert_run(empty_run(job_id="queued", provider="fake", state=RunState.QUEUED.value))
             decision = classify_recovery(queued, ProcessProbe(False, False))
             self.assertEqual(decision.classification, "queued_not_started")
             self.assertFalse(decision.launch_provider)
+            db.close()
+
+    def test_recover_cannot_succeed_when_source_integrity_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = load_config(root)
+            config.ensure_dirs()
+            db = Database(config.db_path)
+            locks = LockManager(db)
+            repo = root / "repo"
+            make_repo(repo)
+            (repo / "marker.txt").write_text("ok\n", encoding="utf-8")
+            dead = subprocess.Popen(["true"])
+            dead.wait(timeout=5)
+            run = db.insert_run(
+                empty_run(
+                    job_id="bypass",
+                    provider="fake",
+                    state=RunState.RUNNING.value,
+                    attempt=1,
+                    max_attempts=2,
+                    pid=dead.pid,
+                    process_meta={"match": "gone-provider"},
+                    provider_exit_code=0,
+                    verification_ran=False,
+                    job_snapshot=_job_snapshot(["test -f marker.txt"]),
+                    workspace_path=str(repo),
+                    source_repo=str(repo),
+                    source_revision="unused",
+                    run_dir=str(config.runs_dir / "bypass"),
+                    source_head="unused",
+                    base_ref="HEAD",
+                    source_integrity=dumps(capture(repo)),
+                )
+            )
+            subprocess.check_call(["git", "-C", str(repo), "config", "--local", "nightshift.bypass", "1"])
+            updated, applied = recover_run(config, db, locks, run.run_id)
+            self.assertEqual(applied.classification, "verification_never_ran")
+            self.assertFalse(applied.launch_provider)
+            self.assertTrue(updated.verification_ran)
+            self.assertEqual(updated.verification_exit_code, 0)
+            self.assertNotEqual(updated.state, RunState.SUCCEEDED.value)
+            self.assertIn("SOURCE_INTEGRITY_VIOLATION", updated.failure_reason)
             db.close()
 
     def test_retry_stops_at_max_attempts(self) -> None:

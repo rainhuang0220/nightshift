@@ -25,6 +25,7 @@ from nightshift.models import (
 )
 from nightshift.providers.base import terminate_process
 from nightshift.queue import claim_next
+from nightshift.finalize import check_stored_integrity, decide_final, extension_audit_ok
 from nightshift.runner import execute_run, publish_report, run_verification_only
 
 TERMINAL_VALUES = {state.value for state in TERMINAL_STATES}
@@ -256,6 +257,7 @@ def serve(config: Config, db: Database, locks: LockManager, stop: threading.Even
 
 
 def _finalize_recorded(db: Database, run_id: str, decision: RecoveryDecision) -> None:
+    """Apply the same success gate as a normal run. Does not launch a provider."""
     run = db.require_run(run_id)
     if run.state == RunState.RUNNING.value:
         db.transition(run_id, RunState.VERIFYING.value, "recover: provider already exited")
@@ -263,22 +265,26 @@ def _finalize_recorded(db: Database, run_id: str, decision: RecoveryDecision) ->
     if run.state in TERMINAL_VALUES:
         db.update_run(run_id, recovery_class=decision.classification)
         return
-    ok = run.provider_exit_code == 0 and run.verification_exit_code == 0 and run.verification_ran
-    final = RunState.SUCCEEDED.value if ok else RunState.FAILED.value
-    reason = "" if ok else decision.reason
-    if not ok and run.provider_exit_code not in (None, 0):
-        reason = f"provider exited {run.provider_exit_code}"
-    elif not ok and run.verification_exit_code not in (None, 0):
-        reason = f"verification exit {run.verification_exit_code}"
+    workspace_exists = bool(run.workspace_path) and Path(run.workspace_path).is_dir()
+    integrity = check_stored_integrity(run.source_repo, run.source_integrity)
+    final = decide_final(
+        provider_exit_code=run.provider_exit_code,
+        verification_ran=run.verification_ran,
+        verification_exit_code=run.verification_exit_code,
+        workspace_exists=workspace_exists,
+        integrity_ok=integrity.ok,
+        safety_audit_ok=extension_audit_ok(run.provider, run.invocation),
+        integrity_detail=integrity.detail,
+    )
     ended = utc_now()
     db.transition(
         run_id,
-        final,
-        "finalized from recorded exit codes",
-        failure_reason=reason,
+        final.state,
+        final.reason or "finalized",
+        failure_reason=final.reason,
         recovery_class=decision.classification,
         ended_at=ended,
-        exit_code=exit_code_for_state(final),
+        exit_code=exit_code_for_state(final.state),
         duration_seconds=run.duration_seconds,
     )
 

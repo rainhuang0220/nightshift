@@ -13,24 +13,58 @@ Schema version is 1. Unknown keys are rejected. `prompt.md` must exist beside th
 | `description` | yes | One non-empty string shown in the report |
 | `type` | yes | Free label such as `audit` or `fix`. Not dispatched |
 | `repository` | yes | Target checkout. Relative paths resolve against the job directory |
-| `base_ref` | yes | Git ref resolved to a commit before the worktree is created. `HEAD` is allowed |
-| `provider` | yes | `grok` or `fake`. `cursor` is rejected in v0.1 |
+| `base_ref` | yes | Git ref resolved to a commit before the workspace is created. `HEAD` is allowed |
+| `provider` | yes | `grok` or `fake`. `cursor` is rejected |
 | `model` | no | Passed to Grok as `--model` when set |
 | `max_runtime_seconds` | yes | Integer from 1 to 86400. The supervisor stops the child at this limit |
 | `max_attempts` | yes | Integer from 1 to 10. Counts explicit retries |
 | `concurrency_group` | yes | Non-empty name. Two active runs in the same group do not overlap |
-| `network` | yes | Boolean. `true` allows Grok web search tools and leaves web search enabled |
+| `network` | yes | Boolean. `false` passes `--disable-web-search` and withholds web tools |
 | `write_scope` | yes | `none` or `workspace` |
+| `isolation` | no | `clone` (default) or `worktree` |
+| `allow_legacy_shell_verification` | no | Boolean, default false. Opts a Grok job into shell-string verification |
 | `expected_artifacts` | yes | List of paths relative to the workspace. May be empty. Reported, not required for success |
-| `verification` | yes | List of shell commands run after the provider, in the worktree. May be empty |
+| `verification` | yes | Commands run after the provider, in the workspace. May be empty |
 | `success_criteria` | yes | At least one sentence. Recorded in the report. Not executed |
 | `allow_bash` | no | Extra Grok `Bash(...)` patterns. Cannot authorize the forbidden snippets below |
 
-`verification` commands are trusted operator input. Nightshift snapshots them into SQLite before the provider starts and runs them with the shell. Write them as carefully as you would write a script you intend to run unattended.
+`base_ref` is resolved once and the workspace checks out that exact revision.
+
+`isolation = "clone"` builds an independent local clone. `isolation = "worktree"` adds a linked worktree. The worktree backend shares the source git directory, is labeled weaker isolation, and is not the default for unattended jobs.
+
+`network = false` disables Grok web search. The provider seatbelt still allows network so the model API can be reached. See `docs/threat-model.md`.
+
+## Verification
+
+`verification` is either a list of strings or a list of argv tables. Mixing the two is rejected.
+
+The unattended form is structured:
+
+```toml
+[[verification]]
+argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+timeout_seconds = 300
+```
+
+`argv` is a non-empty list of non-empty strings. `timeout_seconds` is optional and, when set, is an integer from 1 to 86400. Unknown keys on a step are rejected. Nightshift runs the argv directly in the isolated workspace under the verification seatbelt. There is no shell expansion.
+
+A list of strings is legacy shell verification:
+
+```toml
+verification = ["python3 -m unittest discover -s tests"]
+```
+
+Each string is run as `/bin/sh -c` under the same seatbelt. That form is unsafe relative to the argv form because the shell parses it. Grok jobs that use it are blocked unless `allow_legacy_shell_verification = true`. FakeProvider jobs still accept it so existing dry runs keep working. Do not use the legacy form for unattended Grok jobs.
+
+An empty list runs no commands and counts as verification exit 0.
+
+Verification commands are trusted operator input. Nightshift snapshots them into SQLite before the provider starts. The model cannot replace them.
 
 ## Write scope
 
-`none` asks for a read-only sandbox profile and does not allow Edit/Write. `workspace` asks for the `workspace` sandbox profile and allows edits and local git commits inside the isolated worktree. Neither scope permits push, publishing, or edits to the original checkout. See `docs/threat-model.md` for which of those limits are enforced.
+`none` asks Grok for a read-only sandbox profile and does not allow Edit/Write through Grok's permission rules. `workspace` asks for the `workspace` sandbox profile and allows edits and local git commits inside the isolated workspace. Neither scope permits push, publishing, or edits to the original checkout.
+
+Those Grok profiles are tool-call filters plus a flag Grok may or may not enforce. Filesystem containment is the seatbelt. See `docs/threat-model.md`.
 
 ## Forbidden `allow_bash` snippets
 
@@ -46,7 +80,7 @@ gh pr merge
 kaggle
 ```
 
-Deny rules and the PATH shim still block those actions when a job tries to reach them another way.
+Grok deny rules still name those actions. The PATH shim still refuses the PATH lookup. The seatbelt still confines filesystem writes. None of those three is a substitute for the others.
 
 ## Example
 
@@ -65,6 +99,7 @@ max_attempts = 1
 concurrency_group = "repo-audit-example"
 network = false
 write_scope = "none"
+isolation = "clone"
 expected_artifacts = []
 verification = []
 success_criteria = [
@@ -75,4 +110,6 @@ success_criteria = [
 
 ## What the provider sees
 
-Nightshift writes `runs/<run-id>/prompt.final.md` by prefixing the job prompt with a policy preamble. The preamble tells the model to stay in the worktree. It is an instruction, not a security boundary.
+Nightshift writes `runs/<run-id>/prompt.final.md` by prefixing the job prompt with a policy preamble. The preamble tells the model to stay in the isolated workspace and that the original checkout is off limits. It is an instruction, not a security boundary.
+
+The child process sees a private `HOME`, `GROK_HOME=state/grok-profile` (as an absolute path only inside the child), `GROK_MEMORY=0`, and `GROK_WORKFLOWS=0`. It does not see the operator's normal Grok skills, plugins, hooks, or MCP credentials.
