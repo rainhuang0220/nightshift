@@ -26,7 +26,14 @@ CATEGORIES = (
     "hooks",
     "worktrees",
 )
+# Hooks and worktree metadata are expected to be small. Above this size the
+# tree snapshot fails closed instead of recording size alone. The index,
+# config, and packed-refs are always content-hashed.
 _MAX_HASH_BYTES = 1_000_000
+
+
+class IntegrityError(Exception):
+    """Raised when protected metadata cannot be hashed completely."""
 
 
 @dataclass(frozen=True)
@@ -148,38 +155,93 @@ def _absolute_git(repo: Path, flag: str, name: str | None = None) -> Path:
 
 
 def _sha256_file(path: Path) -> str:
-    if not path.is_file():
+    """Hash one protected file, or a symlink's target. Missing means empty.
+
+    A symlink is recorded as a link plus its target. The object database is
+    not passed here. An unreadable path fails closed.
+    """
+    if path.is_symlink():
+        digest = hashlib.sha256()
+        digest.update(b"link\0")
+        digest.update(os.readlink(path).encode())
+        return digest.hexdigest()
+    if not path.exists():
         return ""
+    if not path.is_file():
+        raise IntegrityError(f"protected metadata is not a file: {path.name}")
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise IntegrityError("unreadable protected metadata") from exc
     return digest.hexdigest()
 
 
 def _sha256_tree(root: Path) -> str:
-    if not root.exists():
+    """Hash entry type, relative path, symlink target, and file bytes.
+
+    Directory entries are included so an added or replaced directory changes
+    the snapshot. Symlink directories are not followed. The Git object
+    database is not walked. Oversized or unreadable entries fail closed.
+    """
+    if not root.exists() and not root.is_symlink():
         return ""
     digest = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames.sort()
-        for name in sorted(filenames):
-            path = Path(dirpath) / name
-            rel = path.relative_to(root).as_posix()
+    if root.is_symlink():
+        digest.update(b".\0link\0")
+        digest.update(os.readlink(root).encode())
+        digest.update(b"\n")
+        return digest.hexdigest()
+    if not root.is_dir():
+        raise IntegrityError("protected metadata tree is not a directory")
+
+    def walk(directory: Path) -> None:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise IntegrityError("unreadable protected metadata") from exc
+        for entry in entries:
+            rel = entry.relative_to(root).as_posix()
             digest.update(rel.encode())
             digest.update(b"\0")
             try:
-                if path.is_symlink():
-                    digest.update(b"link\0")
-                    digest.update(os.readlink(path).encode())
-                elif path.is_file():
-                    size = path.stat().st_size
-                    if size > _MAX_HASH_BYTES:
-                        digest.update(f"large\0{size}".encode())
-                    else:
-                        digest.update(b"file\0")
-                        digest.update(_sha256_file(path).encode())
-            except OSError:
-                digest.update(b"unreadable\0")
+                is_link = entry.is_symlink()
+            except OSError as exc:
+                raise IntegrityError("unreadable protected metadata") from exc
+            if is_link:
+                digest.update(b"link\0")
+                try:
+                    digest.update(os.readlink(entry).encode())
+                except OSError as exc:
+                    raise IntegrityError("unreadable protected metadata") from exc
+            elif entry.is_dir():
+                digest.update(b"dir\0")
+                walk(entry)
+            elif entry.is_file():
+                try:
+                    size = entry.lstat().st_size
+                except OSError as exc:
+                    raise IntegrityError("unreadable protected metadata") from exc
+                if size > _MAX_HASH_BYTES:
+                    raise IntegrityError(f"protected metadata exceeds {_MAX_HASH_BYTES} bytes")
+                digest.update(b"file\0")
+                digest.update(_file_bytes_digest(entry).encode())
+            else:
+                digest.update(b"other\0")
             digest.update(b"\n")
+
+    walk(root)
+    return digest.hexdigest()
+
+
+def _file_bytes_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise IntegrityError("unreadable protected metadata") from exc
     return digest.hexdigest()
