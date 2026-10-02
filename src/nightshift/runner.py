@@ -11,7 +11,12 @@ from pathlib import Path
 from nightshift.config import Config
 from nightshift.containment import build_read_policy, contained_run, sandbox_available, write_profile
 from nightshift.db import Database
-from nightshift.extensions import neutralize_project_extensions, project_instruction_names, run_inspect
+from nightshift.extensions import (
+    neutralize_project_extensions,
+    project_instruction_names,
+    restore_neutralized_extensions,
+    run_inspect,
+)
 from nightshift.finalize import (
     BLOCKED_EXTENSION_SURFACE,
     check_stored_integrity,
@@ -98,6 +103,7 @@ def execute_run(
     host = _host_info()
     run = db.update_run(run_id, run_dir=str(run_dir), host_info=host, report_path=str(run_dir / "report.md"))
     _emit(db, run_dir, run_id, "prepare", "run directory ready", RunState.PREPARING.value)
+    dest: Path | None = None
     try:
         repo = resolved_repository(job)
         run = db.update_run(run_id, source_repo=str(repo), base_ref=job.base_ref)
@@ -228,6 +234,10 @@ def execute_run(
             poll_stop=poll_stop,
             heartbeat=lambda: db.heartbeat(run_id),
         )
+        # Neutralization hides executable project config from the provider.
+        # Put those entries back before verification and the report, so a
+        # read-only job does not keep clone deletions.
+        restore_neutralized_extensions(dest, run_dir)
         current = db.require_run(run_id)
         if current.state == RunState.CANCELLED.value:
             _finish_times(db, run_id, exit_code=exit_code_for_state(RunState.CANCELLED.value))
@@ -312,15 +322,37 @@ def execute_run(
             pass
         return db.require_run(run_id)
     finally:
+        if dest is not None:
+            restore_neutralized_extensions(dest, run_dir)
         scrub_per_run_auth(run_dir)
         locks.release(run_id)
 
 
 def run_verification_only(config: Config, db: Database, run_id: str) -> RunRecord:
-    """Run snapshotted verification commands. Does not launch a provider."""
+    """Run snapshotted verification commands. Does not launch a provider.
+
+    Verification does not receive a copy of the auth file. Recovery scrubs
+    any copy first; this function scrubs again on the way out so a later
+    environment setup cannot leave one behind.
+    """
     run = db.require_run(run_id)
     job = _job_from_run(run)
     run_dir = Path(run.run_dir) if run.run_dir else config.runs_dir / run_id
+    scrub_per_run_auth(run_dir)
+    try:
+        return _run_verification_only(config, db, run_id, run_dir, run, job)
+    finally:
+        scrub_per_run_auth(run_dir)
+
+
+def _run_verification_only(
+    config: Config,
+    db: Database,
+    run_id: str,
+    run_dir: Path,
+    run: RunRecord,
+    job: JobModel,
+) -> RunRecord:
     _ensure_run_files(run_dir)
     workspace = Path(run.workspace_path) if run.workspace_path else None
     if workspace is None or not workspace.exists():
@@ -330,7 +362,7 @@ def run_verification_only(config: Config, db: Database, run_id: str) -> RunRecor
     if run.state == RunState.RUNNING.value:
         db.transition(run_id, RunState.VERIFYING.value, "recover: verification never ran")
     source = Path(run.source_repo) if run.source_repo else workspace
-    env = _child_env(config, run_dir, workspace, source, run_id)
+    env = _child_env(config, run_dir, workspace, source, run_id, copy_auth=False)
     if not sandbox_available():
         _settle(db, run_id, RunState.FAILED.value, "sandbox-exec is not available; refusing to run unsandboxed")
         publish_report(config, db, run_id)
@@ -618,13 +650,21 @@ def _write_metadata(run_dir: Path, run: RunRecord) -> None:
     )
 
 
-def _child_env(config: Config, run_dir: Path, workspace: Path, source: Path, run_id: str) -> dict[str, str]:
+def _child_env(
+    config: Config,
+    run_dir: Path,
+    workspace: Path,
+    source: Path,
+    run_id: str,
+    *,
+    copy_auth: bool = True,
+) -> dict[str, str]:
     del run_id
     bin_dir = run_dir / "bin"
     hooks = run_dir / "empty-hooks"
     gitconfig = run_dir / "empty-gitconfig"
     write_private_text(gitconfig, "")
-    grok_home = prepare_run_grok_home(run_dir, config.auth_store())
+    grok_home = prepare_run_grok_home(run_dir, config.auth_store(), copy_auth=copy_auth)
     runtime_home, private_tmp = prepare_runtime_dirs(run_dir)
     staged = stage_pythonpath(run_dir)
     real = {

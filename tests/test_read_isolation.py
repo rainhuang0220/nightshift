@@ -369,6 +369,114 @@ class RuntimeProfileTests(unittest.TestCase):
             self.assertEqual((home / "config.toml").read_text(encoding="utf-8"), "keep-diagnostic\n")
             self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
 
+    def test_verification_recovery_does_not_leave_per_run_auth(self) -> None:
+        import subprocess
+
+        from nightshift.integrity import capture, dumps
+        from nightshift.models import empty_run
+        from nightshift.supervisor import recover_run
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            operator = root / "operator"
+            operator.mkdir()
+            (operator / "auth.json").write_bytes(b"synthetic-auth-material")
+            config = load_config(root / "ns")
+            config.ensure_dirs()
+            auth_bootstrap(config.auth_store(), source_home=operator)
+            before = (config.auth_store() / "auth.json").read_bytes()
+            db = Database(config.db_path)
+            locks = LockManager(db)
+            workspace = root / "verify-ws"
+            make_repo(workspace)
+            (workspace / "marker.txt").write_text("ok\n", encoding="utf-8")
+            dead = subprocess.Popen(["true"])
+            dead.wait(timeout=5)
+            try:
+                run = db.insert_run(
+                    empty_run(
+                        job_id="verify-auth",
+                        provider="fake",
+                        state=RunState.RUNNING.value,
+                        attempt=1,
+                        max_attempts=1,
+                        pid=dead.pid,
+                        process_meta={"match": "gone-provider", "pid": dead.pid},
+                        provider_exit_code=0,
+                        verification_ran=False,
+                        job_snapshot=(
+                            '{"schema_version":1,"id":"verify-auth","description":"recover","type":"note",'
+                            '"repository":"/tmp/unused","base_ref":"HEAD","provider":"fake","model":null,'
+                            '"max_runtime_seconds":30,"max_attempts":1,"concurrency_group":"verify-auth",'
+                            '"network":false,"write_scope":"none","expected_artifacts":[],'
+                            '"verification":["test -f marker.txt"],"success_criteria":["kept"],'
+                            '"allow_bash":[],"prompt":"noop\\n","job_dir":"/tmp","job_file":"/tmp/job.toml"}'
+                        ),
+                        workspace_path=str(workspace),
+                        source_repo=str(workspace),
+                        source_revision="unused",
+                        run_dir=str(config.runs_dir / "verify-auth"),
+                        source_head="unused",
+                        base_ref="HEAD",
+                        source_integrity=dumps(capture(workspace)),
+                    )
+                )
+                home = prepare_run_grok_home(Path(run.run_dir), config.auth_store())
+                self.assertTrue((home / "auth.json").is_file())
+                updated, applied = recover_run(config, db, locks, run.run_id)
+            finally:
+                db.close()
+            self.assertEqual(applied.classification, "verification_never_ran")
+            self.assertFalse(applied.launch_provider)
+            self.assertTrue(updated.verification_ran)
+            self.assertFalse((home / "auth.json").exists())
+            self.assertEqual((config.auth_store() / "auth.json").read_bytes(), before)
+
+    def test_read_only_run_restores_neutralized_clone_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            make_repo(source)
+            (source / ".mcp.json").write_text('{"mcpServers":{}}\n', encoding="utf-8")
+            skill = source / ".claude" / "skills" / "emitting-output"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("synthetic skill\n", encoding="utf-8")
+            git = __import__("subprocess")
+            git.check_call(["git", "-C", str(source), "add", "-A"])
+            git.check_call(["git", "-C", str(source), "commit", "-m", "extensions"])
+            job_dir = root / "job"
+            write_job(
+                job_dir,
+                source,
+                provider="fake",
+                write_scope="none",
+                network=False,
+                verification=[],
+                expected_artifacts=[],
+            )
+            config = load_config(root / "ns")
+            config.ensure_dirs()
+            db = Database(config.db_path)
+            locks = LockManager(db)
+            try:
+                run = enqueue(db, job_dir, provider="fake")
+                finished = execute_run(config, db, locks, run.run_id)
+            finally:
+                db.close()
+            self.assertEqual(finished.state, RunState.SUCCEEDED.value, finished.failure_reason)
+            workspace = Path(finished.workspace_path)
+            status = git.check_output(
+                ["git", "-C", str(workspace), "status", "--porcelain=v1"],
+                text=True,
+            )
+            self.assertEqual(status, "")
+            self.assertEqual((workspace / ".mcp.json").read_text(encoding="utf-8"), '{"mcpServers":{}}\n')
+            self.assertEqual((workspace / ".claude" / "skills" / "emitting-output" / "SKILL.md").read_text(encoding="utf-8"), "synthetic skill\n")
+            self.assertTrue((source / ".mcp.json").is_file())
+            report = (config.runs_dir / finished.run_id / "report.md").read_text(encoding="utf-8")
+            self.assertIn("(no file changes detected)", report)
+            self.assertFalse((config.runs_dir / finished.run_id / "grok-home" / "auth.json").exists())
+
     def _source(self, root: Path) -> Path:
         origin = root / "origin"
         origin.mkdir()

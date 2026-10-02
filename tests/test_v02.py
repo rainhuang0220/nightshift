@@ -198,6 +198,40 @@ class ExtensionTests(unittest.TestCase):
             self.assertTrue((source / ".grok" / "config.toml").is_file())
             self.assertTrue((source / ".mcp.json").is_file())
 
+    def test_outside_symlink_is_unlinked_and_restored_without_moving_the_target(self) -> None:
+        from nightshift.extensions import restore_neutralized_extensions
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            dest = root / "clone"
+            make_repo(source)
+            prepare_workspace(inspect_source(source, "HEAD"), dest, "clone")
+            outside = root / "outside-cursor"
+            outside.mkdir()
+            (outside / "mcp.json").write_text("operator-mcp\n", encoding="utf-8")
+            outside_file = root / "outside-mcp.json"
+            outside_file.write_text("operator-file\n", encoding="utf-8")
+            (dest / ".cursor").symlink_to(outside)
+            (dest / ".mcp.json").symlink_to(outside_file)
+            moved = neutralize_project_extensions(dest, root / "record")
+            self.assertTrue(any(item.startswith(".cursor") for item in moved))
+            self.assertTrue(any(item.startswith(".mcp.json") for item in moved))
+            self.assertFalse((dest / ".cursor").exists())
+            self.assertFalse((dest / ".mcp.json").exists())
+            self.assertEqual((outside / "mcp.json").read_text(encoding="utf-8"), "operator-mcp\n")
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "operator-file\n")
+            restored = restore_neutralized_extensions(dest, root / "record")
+            self.assertIn(".cursor", restored)
+            self.assertIn(".mcp.json", restored)
+            self.assertTrue((dest / ".cursor").is_symlink())
+            self.assertEqual((dest / ".cursor").resolve(), outside.resolve())
+            self.assertTrue((dest / ".mcp.json").is_symlink())
+            self.assertEqual((dest / ".mcp.json").resolve(), outside_file.resolve())
+            self.assertEqual((outside / "mcp.json").read_text(encoding="utf-8"), "operator-mcp\n")
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "operator-file\n")
+            self.assertEqual(restore_neutralized_extensions(dest, root / "record"), [])
+
 
 class VerificationTests(unittest.TestCase):
     def test_structured_verification_parses_and_legacy_shell_blocks_grok(self) -> None:

@@ -60,12 +60,22 @@ def prepare_runtime_dirs(run_dir: Path) -> tuple[Path, Path]:
     return runtime_home, private_tmp
 
 
-def prepare_run_grok_home(run_dir: Path, auth_store: Path) -> Path:
-    """Create a private per-run GROK_HOME and copy the minimum auth file."""
+def prepare_run_grok_home(run_dir: Path, auth_store: Path, *, copy_auth: bool = True) -> Path:
+    """Create a private per-run GROK_HOME.
+
+    Provider launches copy the minimum auth file. Verification does not.
+    A verification child can read the run directory, so leaving the copy
+    there would publish the credential to that command.
+    """
     home = ensure_private_dir(per_run_grok_home(run_dir))
+    destination = home / AUTH_FILENAME
+    if not copy_auth:
+        if destination.is_symlink() or destination.exists():
+            destination.unlink()
+        return home
     source = auth_store / AUTH_FILENAME
     if source.is_file() and not source.is_symlink():
-        copy_auth_file(source, home / AUTH_FILENAME)
+        copy_auth_file(source, destination)
     return home
 
 

@@ -50,23 +50,110 @@ class NeutralizeResult:
     moved: list[str] = field(default_factory=list)
 
 
+def _escaping_symlink(workspace: Path, relative: Path) -> Path | None:
+    """Return the first symlink on `relative` whose target leaves `workspace`.
+
+    Walking stops at that symlink. Callers unlink it and do not move the
+    target, so a clone entry that points at the operator home cannot be
+    followed into a real directory.
+    """
+    current = workspace
+    for part in relative.parts:
+        current = current / part
+        if not current.is_symlink():
+            if not current.exists():
+                return None
+            continue
+        try:
+            current.resolve().relative_to(workspace)
+        except ValueError:
+            return current
+    return None
+
+
 def neutralize_project_extensions(workspace: Path, record_dir: Path) -> list[str]:
-    """Move or unlink extension config inside `workspace` only."""
+    """Move extension config out of `workspace` for the provider process.
+
+    The move is temporary. `restore_neutralized_extensions` puts the same
+    entries back. A symlink that points outside the workspace is unlinked
+    and remembered; its target is not moved or deleted. The source
+    repository is not a workspace and is not modified.
+    """
+    root = workspace.resolve()
+    actions: list[dict[str, str]] = []
     moved: list[str] = []
     for relative in _NEUTRALIZE:
+        escape = _escaping_symlink(root, relative)
+        if escape is not None:
+            link = escape.relative_to(root).as_posix()
+            actions.append({"path": link, "kind": "symlink", "target": os.readlink(escape)})
+            escape.unlink()
+            moved.append(link + " (symlink unlinked)")
+            continue
         path = workspace / relative
         if not path.exists() and not path.is_symlink():
             continue
         label = relative.as_posix()
         if path.is_symlink():
+            actions.append({"path": label, "kind": "symlink", "target": os.readlink(path)})
             path.unlink()
             moved.append(label + " (symlink unlinked)")
             continue
         destination = record_dir / "neutralized" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(destination))
+        actions.append({"path": label, "kind": "dir" if destination.is_dir() else "file"})
         moved.append(label)
+    if actions:
+        manifest = record_dir / "neutralized-manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps(actions) + "\n", encoding="utf-8")
     return moved
+
+
+def restore_neutralized_extensions(workspace: Path, record_dir: Path) -> list[str]:
+    """Put neutralized clone entries back so the workspace matches the checkout.
+
+    An entry the provider replaced is left in place. Calling this twice is
+    safe: the second call finds the restored path and does nothing.
+    """
+    if not workspace.is_dir():
+        return []
+    manifest = record_dir / "neutralized-manifest.json"
+    if not manifest.is_file():
+        return []
+    try:
+        actions = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(actions, list):
+        return []
+    restored: list[str] = []
+    for action in reversed(actions):
+        if not isinstance(action, dict):
+            continue
+        relative = str(action.get("path") or "")
+        kind = str(action.get("kind") or "")
+        if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+            continue
+        destination = workspace / relative
+        if destination.exists() or destination.is_symlink():
+            continue
+        if kind == "symlink":
+            target = action.get("target")
+            if not isinstance(target, str):
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(target)
+            restored.append(relative)
+            continue
+        source = record_dir / "neutralized" / relative
+        if not source.exists() and not source.is_symlink():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        restored.append(relative)
+    return restored
 
 
 def project_instruction_names(workspace: Path) -> list[str]:
