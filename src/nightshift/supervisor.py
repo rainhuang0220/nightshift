@@ -110,12 +110,12 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
                 False,
             )
         if not run.verification_ran:
+            if (run.process_meta or {}).get("phase") == "verifying":
+                return RecoveryDecision("verification_interrupted", "mark", RunState.INTERRUPTED.value,
+                                        "verification started but its result is unknown; commands were not repeated", False)
             return RecoveryDecision(
-                "verification_never_ran",
-                "verify",
-                None,
-                "left in VERIFYING before verification finished",
-                False,
+                "verification_never_ran", "verify", None,
+                "left in VERIFYING before verification started", False,
             )
         return RecoveryDecision("provider_exited", "finalize", None, "verification recorded; finalize", False)
     return RecoveryDecision("already_terminal", "leave", None, f"unhandled state {run.state}", False)
@@ -146,6 +146,17 @@ def probe_run(run: RunRecord) -> ProcessProbe:
 
 
 def recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:
+    from nightshift.locks import execution_lease
+
+    with execution_lease(config.state_dir, run_id) as owned:
+        if not owned:
+            return db.require_run(run_id), RecoveryDecision(
+                "controller_still_alive", "leave", None, "controller owns this run", False,
+            )
+        return _recover_run(config, db, locks, run_id)
+
+
+def _recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:
     run = db.require_run(run_id)
     probe = probe_run(run)
     decision = classify_recovery(run, probe)

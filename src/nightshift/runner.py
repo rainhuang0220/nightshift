@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,7 +106,17 @@ class RunCancelled(Exception):
     pass
 
 
-def execute_run(
+def execute_run(config: Config, db: Database, locks: LockManager, run_id: str, stop_event=None) -> RunRecord:
+    from nightshift.locks import execution_lease
+    from nightshift.models import BlockedError
+
+    with execution_lease(config.state_dir, run_id) as owned:
+        if not owned:
+            raise BlockedError("another controller owns this run; inspect or recover after it exits")
+        return _execute_run(config, db, locks, run_id, stop_event)
+
+
+def _execute_run(
     config: Config,
     db: Database,
     locks: LockManager,
@@ -129,6 +141,11 @@ def execute_run(
     _emit(db, run_dir, run_id, "prepare", "run directory ready", RunState.PREPARING.value)
     dest: Path | None = None
     try:
+        if job.work_order:
+            from nightshift.intake import check_freshness
+            from nightshift.work_order import validate
+            validate(job.work_order)
+            check_freshness(job.work_order)
         repo = resolved_repository(job)
         run = db.update_run(run_id, source_repo=str(repo), base_ref=job.base_ref)
         if not is_git_repo(repo):
@@ -469,6 +486,8 @@ def _run_verification_only(
         log_path=current_attempt / "verification.log",
         timeout=float(job.max_runtime_seconds or run.max_runtime_seconds or 600),
         profile=_verification_profile(config, current_attempt, workspace, source),
+        poll_stop=lambda: "cancel" if db.require_run(run_id).state == RunState.CANCELLED.value else None,
+        on_pid=lambda pid, pgid: _mark_phase(db, run_id, "verifying", pid, pgid=pgid, match=run_id),
     )
     db.update_run(run_id, verification_ran=True, verification_exit_code=ver_code)
     current = db.require_run(run_id)
@@ -547,6 +566,16 @@ def publish_report(
             )
     if missing:
         uncertainty.append("Expected artifacts missing: " + ", ".join(missing))
+    results_file = _resolve_run_file(run_dir, run.attempt, "verification-results.json")
+    verification_results = []
+    if results_file.is_file():
+        try:
+            verification_results = json.loads(_read(results_file))
+        except ValueError:
+            uncertainty.append("Verification journal is incomplete; inspect private logs.")
+    executed = [r["display"] for r in verification_results if r.get("exit_code") is not None]
+    if not results_file.is_file() and run.verification_ran:
+        executed = list(job.verification)  # Legacy attempts have no per-check journal.
     boundary = (run.invocation or {}).get("trust_boundary") or {}
     info = ReportInputs(
         run_id=run.run_id,
@@ -573,7 +602,8 @@ def publish_report(
         findings=findings,
         commits=commits,
         files_changed=files,
-        verification_commands=list(job.verification),
+        verification_commands=executed,
+        verification_results=verification_results,
         verification_output=_read(_resolve_run_file(run_dir, run.attempt, "verification.log")),
         success_criteria=list(job.success_criteria),
         measurements=extract_metrics(stdout),
@@ -594,7 +624,11 @@ def publish_report(
         inspect_containment=str((run.invocation or {}).get("inspect_containment") or "not-probed"),
         conclusion=conclusion,
     )
-    text = render_report(info)
+    from nightshift.policy import scrub_data
+    text = scrub_text(render_report(info))
+    result = {"schema": "nightshift.result", "version": 1, **asdict(info),
+              "work_order": job.work_order}
+    write_private_text(run_dir / "result.json", json.dumps(scrub_data(result), sort_keys=True, indent=2) + "\n")
     report_path = run_dir / "report.md"
     write_private_text(report_path, text)
     db.update_run(run_id, report_path=str(report_path), artifact_paths=found, run_dir=str(run_dir))
@@ -628,11 +662,20 @@ def run_verification(
     rc = 0
     chunks: list[str] = []
     parts: list[str] = []
-    for step in steps:
+    results: list[dict] = []
+    journal = log_path.with_name("verification-results.json")
+    write_private_text(journal, "[]\n")
+    for index, step in enumerate(steps):
         argv = [str(item) for item in step.get("argv") or []]
         display = str(step.get("display") or " ".join(argv))
         step_timeout = float(step.get("timeout_seconds") or timeout)
         label = "legacy shell verification; confined by seatbelt" if step.get("shell") else "argv verification"
+        started = time.monotonic()
+        record = {"index": index, "argv": argv, "display": display, "started_at": utc_now(),
+                  "ended_at": None, "exit_code": None, "duration_seconds": 0.0}
+        results.append(record)
+        from nightshift.policy import scrub_data
+        write_private_text(journal, json.dumps(scrub_data(results), sort_keys=True) + "\n")
         code, output = contained_run(
             argv,
             cwd=cwd,
@@ -642,13 +685,15 @@ def run_verification(
             poll_stop=poll_stop,
             on_pid=on_pid,
         )
+        record.update(exit_code=code, duration_seconds=time.monotonic() - started, ended_at=utc_now())
+        write_private_text(journal, json.dumps(scrub_data(results), sort_keys=True) + "\n")
         block = f"$ {display}\n# {label}\n{output}exit {code}\n"
         parts.append(block)
         chunks.append(output)
         if code != 0 and rc == 0:
             rc = code
-    write_private_text(log_path, "".join(parts))
-    return rc, "".join(chunks)
+    write_private_text(log_path, scrub_text("".join(parts))[:8 * 1024 * 1024])
+    return rc, "".join(chunks)[:8 * 1024 * 1024]
 
 
 def _settle(db: Database, run_id: str, state: str, reason: str) -> RunRecord:

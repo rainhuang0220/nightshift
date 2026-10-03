@@ -14,6 +14,10 @@ from nightshift.models import RunRecord, RunState, empty_run, utc_now
 
 def enqueue(db: Database, job_path: Path, *, provider: str | None = None) -> RunRecord:
     job = load_job(job_path)
+    return enqueue_job(db, job, provider=provider)
+
+
+def enqueue_job(db: Database, job, *, provider: str | None = None, run_id: str | None = None) -> RunRecord:
     chosen = provider or job.provider
     record = empty_run(
         job_id=job.id,
@@ -35,6 +39,8 @@ def enqueue(db: Database, job_path: Path, *, provider: str | None = None) -> Run
         created_at=utc_now(),
         updated_at=utc_now(),
     )
+    if run_id is not None:
+        record.run_id = run_id
     return db.insert_run(record)
 
 

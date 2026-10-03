@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
@@ -13,6 +14,7 @@ from nightshift.config import Config, load_config
 from nightshift.db import Database
 from nightshift.doctor import run_doctor
 from nightshift.job import JobValidationError, load_job
+from nightshift.work_order import WorkOrderError
 from nightshift.locks import LockManager
 from nightshift.models import (
     EXIT_FAILED,
@@ -36,6 +38,16 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return EXIT_OK
     try:
+        if args.command == "work-order" and args.work_order_command in {"validate", "preview"}:
+            from nightshift.work_order import load, dumps
+            order = load(Path(args.path))
+            if args.work_order_command == "validate":
+                sys.stdout.write(dumps(order))
+            else:
+                from nightshift.intake import plan_order
+                plan = plan_order(order, provider=args.provider, max_runtime_seconds=args.max_runtime_seconds)
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+            return EXIT_OK
         config = load_config(args.root, args.config)
         if args.command == "doctor":
             code, lines = run_doctor(config)
@@ -55,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
             return _dispatch(config, db, locks, args)
         finally:
             db.close()
+    except WorkOrderError as exc:
+        print(scrub_text(f"invalid work order: {exc}"), file=sys.stderr)
+        return EXIT_USAGE
     except JobValidationError as exc:
         for error in exc.errors:
             print(f"invalid: {error}", file=sys.stderr)
@@ -67,6 +82,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(config: Config, db: Database, locks: LockManager, args: argparse.Namespace) -> int:
+    if args.command == "work-order" and args.work_order_command == "import":
+        from nightshift.intake import import_order
+        from nightshift.work_order import load
+        run = import_order(db, load(Path(args.path)), provider=args.provider, max_runtime_seconds=args.max_runtime_seconds)
+        if args.run and run.state == RunState.QUEUED.value:
+            run = execute_run(config, db, locks, run.run_id)
+        print(json.dumps({"run_id": run.run_id, "state": run.state, "attempt": run.attempt,
+                          "workspace": run.workspace_path, "report": run.report_path}, sort_keys=True))
+        return exit_code_for_state(run.state) if args.run else EXIT_OK
     if args.command == "queue" and args.queue_command == "add":
         run = enqueue(db, Path(args.path), provider=args.provider)
         print(f"queued {run.run_id} {run.job_id} {run.state}")
@@ -229,6 +253,17 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check Python, state, SQLite, and the Grok CLI")
     sub.add_parser("version", help="print the Nightshift version")
+
+    work_order = sub.add_parser("work-order", help="validate, preview and import generic Engineering Work Orders v1")
+    order_sub = work_order.add_subparsers(dest="work_order_command", required=True)
+    for command in ("validate", "preview", "import"):
+        entry = order_sub.add_parser(command)
+        entry.add_argument("path")
+        if command != "validate":
+            entry.add_argument("--provider", choices=("fake", "grok"), required=True)
+            entry.add_argument("--max-runtime-seconds", type=int, default=900)
+        if command == "import":
+            entry.add_argument("--run", action="store_true", help="execute only if this task is still queued")
 
     job = sub.add_parser("job", help="job manifests")
     job_sub = job.add_subparsers(dest="job_command", required=True)

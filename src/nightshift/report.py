@@ -35,6 +35,7 @@ class ReportInputs:
     files_changed: list[str] = field(default_factory=list)
     verification_commands: list[str] = field(default_factory=list)
     verification_output: str = ""
+    verification_results: list[dict] = field(default_factory=list)
     success_criteria: list[str] = field(default_factory=list)
     measurements: dict[str, str] = field(default_factory=dict)
     host_info: dict[str, str] = field(default_factory=dict)
@@ -187,6 +188,8 @@ def render_report(info: ReportInputs) -> str:
             "## Tests",
             "### Tests executed",
             *[f"- {line}" for line in commands],
+            "### Per-check results",
+            *[f"- {r['display']}: exit {r['exit_code']} ({r['duration_seconds']:.3f}s)" for r in info.verification_results],
             "### Test results",
             "```",
             verification_result,

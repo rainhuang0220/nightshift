@@ -127,3 +127,30 @@ class LockManager:
 
     def release(self, run_id: str) -> None:
         self.db.release_locks(run_id)
+
+
+from contextlib import contextmanager
+import fcntl
+from pathlib import Path
+
+
+@contextmanager
+def execution_lease(state_dir: Path, run_id: str):
+    """One controller per run, released by the kernel even after SIGKILL.
+
+    Lease files are never unlinked: replacing the inode would split owners.
+    Children do not inherit the descriptor (CLOEXEC, close_fds).
+    """
+    from nightshift.priv import ensure_private_dir, open_private_binary
+
+    directory = ensure_private_dir(state_dir / "leases")
+    with open_private_binary(directory / (run_id + ".lock")) as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
