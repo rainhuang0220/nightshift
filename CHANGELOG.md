@@ -16,7 +16,7 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Require a completed Grok stream rather than trusting a zero process exit after cancellation.
 - Reject blank or control-overlapping tool read roots; recovery honors durable check intent across the launch/PID-record crash gap; relative check executables are inspected in the pinned Git tree.
 - Recovery journal and log readers reject symlinks and nonregular files without blocking on FIFOs.
-- Detached new-session descendants can escape process-group cleanup. This verified P1 blocks release.
+- Detached new-session descendants can escape process-group cleanup. This verified P1 blocks release. Real macOS lifetime gates and primary-source evaluation also establish controller-death deadline loss and the limits of launchd, kqueue and owned-volume revocation; no unproved execution mode is introduced.
 - No tag or release has been created. Provider network, workspace disk growth, mutable checks and the absence of a background watchdog remain documented limitations.
 
 

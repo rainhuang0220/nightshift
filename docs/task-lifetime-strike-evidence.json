@@ -1,0 +1,132 @@
+{
+  "analysis_date": "2026-10-04",
+  "decision": "CASE B / NOT READY",
+  "source_baseline": "a8fe10f2fe05c54e9b551823dc55aef3ada32e18",
+  "production_src_changed": false,
+  "lifetime_gate": {
+    "total": 11,
+    "passed": 4,
+    "failed": 7,
+    "errors": 0,
+    "full_gate_coverage": true,
+    "release_gate_passed": false,
+    "failed_cases": [
+      "test_controller_sigkill_preserves_deadline",
+      "test_leader_exits_normally",
+      "test_provider_cancellation",
+      "test_provider_timeout",
+      "test_setpgid_descendant_cannot_escape",
+      "test_setsid_descendant_cannot_escape",
+      "test_terminal_attempt_cannot_write"
+    ],
+    "unrelated_sentinels_all_survived": true,
+    "terminal_attempt": {
+      "actual_seatbelt": true,
+      "state": "SUCCEEDED",
+      "attempt": 1,
+      "source_unchanged": true,
+      "run_id": "ns-e47994b42e3b",
+      "writes_after_boundary": [
+        41,
+        42
+      ],
+      "unrelated_direct_child_alive": true
+    },
+    "controller_death": {
+      "actual_seatbelt": true,
+      "controller_returncode": -9,
+      "automatic_state": "RUNNING",
+      "source_unchanged": true,
+      "writes_after_boundary": [
+        51,
+        52
+      ],
+      "unrelated_direct_child_alive": true
+    },
+    "manual_recovery": {
+      "actual_seatbelt": true,
+      "controller_returncode": -9,
+      "automatic_state": "RUNNING",
+      "source_unchanged": true,
+      "recovered_state": "INTERRUPTED",
+      "first": "controller_gone_child_stopped",
+      "second": "already_terminal",
+      "attempt": 1,
+      "verification_ran": false,
+      "unrelated_direct_child_alive": true
+    }
+  },
+  "native_probes": {
+    "launchd": {
+      "conclusive": true,
+      "leader_exit": 0,
+      "abandon_process_group": false,
+      "writer": {
+        "pid": 12791,
+        "pgid": 12791,
+        "sid": 12791,
+        "expires_at": 3470945.010071875
+      },
+      "writes_after_launchd_exit": [
+        2,
+        3
+      ],
+      "setsid_contained": false,
+      "persistent_service_installed": false
+    },
+    "kqueue": {
+      "registration": "errno:45",
+      "registered_pid": 12832,
+      "events": [],
+      "detached_writer": {
+        "pid": 12833,
+        "pgid": 12833,
+        "sid": 12833,
+        "expires_at": 3470949.27416825
+      },
+      "child_automatically_registered": false,
+      "api_kind": "notification, not termination or write revocation"
+    },
+    "volume": {
+      "conclusive": true,
+      "forced_detach_exit": 0,
+      "held_fd_write_errno": 5,
+      "path_reopened_on_host_after_detach": true,
+      "child_exit": 0,
+      "whole_process_lifetime_bound": false,
+      "requires_new_authority_layout": true
+    }
+  },
+  "diagnostic_review": {
+    "subset_cannot_approve": true,
+    "late_return_rejected": true,
+    "late_sample_rejected": true,
+    "bootstrap_timeout_cleanup": true,
+    "attach_timeout_cleanup": true
+  },
+  "ordinary_unit_suite": {
+    "passed": 131,
+    "log": "nightshift-lifetime-strike-full-suite.log"
+  },
+  "wheel_sdist_build": "passed",
+  "independent_install_contract_smoke": {
+    "foreshadow_version": "0.7.0",
+    "nightshift_version": "0.3.0",
+    "independent_installs": true,
+    "canonical_round_trip": true,
+    "semantic_preservation": true,
+    "preview_state_free": true,
+    "duplicate_import_same_run": true,
+    "unsupported_version_exit": 2,
+    "original_source_unchanged": true,
+    "terminal_run_not_reexecuted": true,
+    "manifest_sha256": "0f2810b78ec1fd72d76b6ed993a2dabcfbd4cef4d29456b240b8593f638e15c7"
+  },
+  "limitations": [
+    "No whole-task process boundary implemented",
+    "No automatic post-controller-death deadline enforcement",
+    "No VM/helper-death/mmap certification",
+    "No workspace quota implemented"
+  ],
+  "host_artifacts": "/Users/rainhuang/agent-infra/engineering-evidence/"
+}
