@@ -229,7 +229,10 @@ def _recover_run(config: Config, db: Database, locks: LockManager, run_id: str) 
 def recover_all(config: Config, db: Database, locks: LockManager, *, retry: bool = False) -> tuple[list[str], bool]:
     lines: list[str] = []
     refused = False
-    for run in list(db.active_runs()):
+    candidates = db.list_runs() if retry else db.active_runs()
+    for run in candidates:
+        if run.state in TERMINAL_VALUES and (not retry or run.state not in RETRYABLE_VALUES):
+            continue
         attempt_before = run.attempt
         updated, decision = recover_run(config, db, locks, run.run_id)
         if updated.attempt != attempt_before:

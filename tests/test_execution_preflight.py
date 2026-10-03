@@ -8,10 +8,23 @@ from nightshift.db import Database
 from nightshift.locks import LockManager
 from nightshift.queue import enqueue
 from nightshift.runner import execute_run
-from nightshift.testkit import make_repo, write_job, snapshot
+from nightshift.testkit import make_repo, write_job, snapshot, run_cli
 
 
 class ExecutionPreflightTests(unittest.TestCase):
+    def test_cli_rejects_control_paths_inside_source_before_creating_state(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / 'source'
+            make_repo(source)
+            job = write_job(root / 'job', source)
+            before = snapshot(source)
+            result = run_cli(source, ['run', str(job)])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('overlap', result.stderr)
+            self.assertEqual(snapshot(source), before)
+            self.assertFalse((source / 'state').exists())
+
     def test_blocked_preflight_does_not_create_a_clone_or_launch_a_provider(self):
         for case in ('recursive', 'overlap', 'missing_executable', 'low_disk', 'missing_sandbox'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:

@@ -61,6 +61,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "safety":
             config.ensure_dirs()
             return _safety(config, args)
+        # Reject operator path mistakes before the first state write.
+        if args.command == 'run' or (args.command == 'queue' and args.queue_command == 'add'):
+            from nightshift.job import resolved_repository
+            config.validate_source_paths(resolved_repository(load_job(Path(args.path))))
+        elif args.command == 'work-order' and args.work_order_command == 'import':
+            from nightshift.work_order import load
+            order = load(Path(args.path))
+            if order['repository']['path'] is not None:
+                config.validate_source_paths(Path(order['repository']['path']))
         db = Database(config.db_path)
         locks = LockManager(db)
         try:

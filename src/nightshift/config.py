@@ -46,6 +46,13 @@ class Config:
 
         return auth_store_dir(self.state_dir)
 
+    def validate_source_paths(self, repository: Path) -> None:
+        source = repository.expanduser().resolve()
+        for control in (self.state_dir, self.runs_dir, self.worktrees_dir):
+            path = control.resolve()
+            if source == path or source in path.parents or path in source.parents:
+                raise UsageError('source repository and control/workspace paths must not overlap')
+
 
 def load_config(root: Path | None = None, config_path: Path | None = None) -> Config:
     env_root = os.environ.get("NIGHTSHIFT_ROOT")

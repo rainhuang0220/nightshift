@@ -10,12 +10,28 @@ from nightshift.config import load_config
 from nightshift.db import Database
 from nightshift.locks import LockManager, process_start_token
 from nightshift.models import empty_run
-from nightshift.supervisor import recover_run
+from nightshift.supervisor import recover_run, recover_all
 from nightshift.job import load_job
 from nightshift.testkit import make_repo, write_job
 
 
 class OrphanRecoveryTests(unittest.TestCase):
+    def test_explicit_retry_also_finds_previously_recovered_terminal_attempt(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = load_config(Path(raw))
+            config.ensure_dirs()
+            db = Database(config.db_path)
+            try:
+                run = empty_run(state='INTERRUPTED', max_attempts=2, attempt=1)
+                db.insert_run(run)
+                lines, refused = recover_all(config, db, LockManager(db), retry=True)
+                self.assertFalse(refused, lines)
+                updated = db.require_run(run.run_id)
+                self.assertEqual(updated.state, 'QUEUED')
+                self.assertEqual(updated.attempt, 2)
+            finally:
+                db.close()
+
     def test_recovery_stops_proved_orphan_without_relaunch_or_attempt_increment(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

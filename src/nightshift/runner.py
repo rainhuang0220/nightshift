@@ -792,7 +792,10 @@ def _execution_preflight(config: Config, job: Job, repo: Path, dest: Path) -> No
         raise RunBlocked(f'workspace destination already exists: {dest}')
     if not sandbox_available():
         raise RunBlocked('sandbox-exec is not available; refusing to run unsandboxed')
-    if shutil.disk_usage(config.worktrees_dir).free < 64 * 1024 * 1024:
+    disk_root = config.worktrees_dir
+    while not disk_root.exists():
+        disk_root = disk_root.parent
+    if shutil.disk_usage(disk_root).free < 64 * 1024 * 1024:
         raise RunBlocked('less than 64 MiB free for an isolated workspace')
     if job.provider == 'grok' and shutil.which('grok') is None:
         raise RunBlocked('grok CLI is not available')
