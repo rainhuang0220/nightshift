@@ -8,10 +8,32 @@ from nightshift.db import Database
 from nightshift.locks import LockManager
 from nightshift.queue import enqueue
 from nightshift.runner import execute_run
-from nightshift.testkit import make_repo, write_job, snapshot, run_cli
+from nightshift.testkit import make_repo, write_job, snapshot, run_cli, git
 
 
 class ExecutionPreflightTests(unittest.TestCase):
+    def test_relative_check_is_inspected_at_pinned_revision_not_current_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / 'source'
+            make_repo(source)
+            script = source / 'check.sh'
+            script.write_text('#!/bin/sh\nexit 0\n')
+            script.chmod(0o755)
+            git(source, 'add', 'check.sh')
+            git(source, 'commit', '-m', 'Add an executable check')
+            revision = git(source, 'rev-parse', 'HEAD').stdout.strip()
+            git(source, 'rm', 'check.sh')
+            git(source, 'commit', '-m', 'Remove check in later revision')
+            before = snapshot(source)
+            job = write_job(root / 'job', source, base_ref=revision)
+            manifest = job / 'job.toml'
+            manifest.write_text(manifest.read_text().replace('verification = ["test -f nightshift-notes/result.md"]',
+                                                            'verification = [{argv=["./check.sh"]}]'))
+            result = run_cli(root / 'ns', ['run', str(job)])
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(snapshot(source), before)
+
     def test_cli_rejects_control_paths_inside_source_before_creating_state(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

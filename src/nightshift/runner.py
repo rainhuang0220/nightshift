@@ -31,6 +31,7 @@ from nightshift.gitutil import (
     commits_since,
     is_git_repo,
     porcelain,
+    run_git,
 )
 from nightshift.guard import write_shims
 from nightshift.integrity import capture, compare, dumps
@@ -151,7 +152,6 @@ def _execute_run(
         if not is_git_repo(repo):
             raise RunBlocked(f"repository is not available: {repo}")
         dest = _workspace_dest(config, run)
-        _execution_preflight(config, job, repo, dest)
         keys = [group_key(job.concurrency_group), repo_key(str(repo)), workspace_key(str(dest))]
         if not locks.acquire(keys, run_id):
             raise RunBlocked(f"lock held for concurrency group {job.concurrency_group} or repository {repo}")
@@ -159,6 +159,7 @@ def _execute_run(
             snapshot = inspect_source(repo, job.base_ref)
         except WorkspaceError as exc:
             raise RunBlocked(str(exc)) from exc
+        _execution_preflight(config, job, repo, dest, revision=snapshot.revision)
         before_prepare = capture(repo)
         run = db.update_run(
             run_id,
@@ -775,7 +776,7 @@ def _resolve_run_file(run_dir: Path, attempt: int, name: str) -> Path:
     return current
 
 
-def _execution_preflight(config: Config, job: Job, repo: Path, dest: Path) -> None:
+def _execution_preflight(config: Config, job: Job, repo: Path, dest: Path, *, revision: str) -> None:
     """Check prerequisites before allocating an isolated checkout."""
     from nightshift.intake import reject_control_plane
     from nightshift.work_order import WorkOrderError
@@ -808,8 +809,13 @@ def _execution_preflight(config: Config, job: Job, repo: Path, dest: Path) -> No
             available = shutil.which(executable) is not None
         else:
             path = Path(executable)
-            path = path if path.is_absolute() else repo / path
-            available = path.is_file() and os.access(path, os.X_OK)
+            if path.is_absolute():
+                available = path.is_file() and os.access(path, os.X_OK)
+            elif '..' in path.parts:
+                available = False
+            else:
+                entry = run_git(repo, ['ls-tree', revision, '--', path.as_posix()], check=False)
+                available = entry.returncode == 0 and entry.stdout.startswith('100755 blob ')
         if not available:
             raise RunBlocked(f'verification executable is unavailable: {executable}')
 
