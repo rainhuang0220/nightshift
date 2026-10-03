@@ -12,4 +12,4 @@ Provider network remains an accepted containment limitation; verification runs o
 
 Implementation and real canary findings: [engineering dogfood](engineering-dogfood.md). Domain vocabulary: [CONTEXT](../CONTEXT.md). The release candidates retain the limitations stated there; no production release is claimed.
 
-Validation: 127 unittest cases pass on macOS/Python 3.14. Compileall, 0.3.0 wheel/sdist, doctor, fake safety probe and independent install boundary checks pass. Baseline was 97 tests. The existing CI now also builds and smokes installed packages on its supported Python matrix.
+Validation: 131 unittest cases pass on macOS/Python 3.14. Compileall, 0.3.0 wheel/sdist, doctor, fake safety probe and independent install boundary checks pass. Baseline was 97 tests. The existing CI now also builds and smokes installed packages on its supported Python matrix.

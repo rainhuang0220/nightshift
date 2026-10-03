@@ -14,6 +14,9 @@ Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Record actual executed checks, timing and exit results in a separate result manifest; do not repeat interrupted verification automatically.
 - Fail closed on malformed config/job types, unsafe control-plane targets, path overlap, low free space and unavailable verification tools.
 - Require a completed Grok stream rather than trusting a zero process exit after cancellation.
+- Reject blank or control-overlapping tool read roots; recovery honors durable check intent across the launch/PID-record crash gap; relative check executables are inspected in the pinned Git tree.
+- Recovery journal and log readers reject symlinks and nonregular files without blocking on FIFOs.
+- Detached new-session descendants can escape process-group cleanup. This verified P1 blocks release.
 - No tag or release has been created. Provider network, workspace disk growth, mutable checks and the absence of a background watchdog remain documented limitations.
 
 
