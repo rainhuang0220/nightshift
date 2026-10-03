@@ -48,12 +48,13 @@ from nightshift.models import (
     TERMINAL_STATES,
     Job as JobModel,
     RunRecord,
+    NightshiftError,
     RunState,
     exit_code_for_state,
     utc_now,
 )
 from nightshift.policy import build_policy, minimal_env, scrub_text
-from nightshift.priv import ensure_private_dir, write_private_text
+from nightshift.priv import ensure_private_dir, write_private_text, read_private_bytes
 from nightshift.providers import get_provider
 from nightshift.providers.base import ProviderRequest
 from nightshift.report import (
@@ -1223,9 +1224,11 @@ def _parse_utc(value: str) -> datetime:
 
 
 def _read(path: Path) -> str:
-    if not path.is_file():
+    try:
+        raw = read_private_bytes(path, max_bytes=8 * 1024 * 1024 + 1)
+    except FileNotFoundError:
         return ""
-    with path.open("rb") as handle:
-        raw = handle.read(8 * 1024 * 1024 + 1)
+    except (OSError, NightshiftError):
+        return '[nightshift: report input is non-regular or unavailable]'
     suffix = "\n[nightshift: report input truncated]\n" if len(raw) > 8 * 1024 * 1024 else ""
     return raw[:8 * 1024 * 1024].decode("utf-8", "replace") + suffix

@@ -13,6 +13,23 @@ from nightshift.testkit import make_repo, write_job
 
 
 class ControllerLeaseTests(unittest.TestCase):
+    def test_non_regular_verification_journal_is_unknown_without_blocking_recovery(self):
+        import os
+        import subprocess
+        import sys
+        from nightshift.testkit import cli_env
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            attempt = root / 'attempt-1'
+            attempt.mkdir()
+            os.mkfifo(attempt / 'verification-results.json')
+            program = ('from nightshift.models import empty_run; '
+                       'from nightshift.supervisor import probe_run; '
+                       'import sys; print(probe_run(empty_run(state="VERIFYING",run_dir=sys.argv[1])).verification_started)')
+            result = subprocess.run([sys.executable, '-c', program, str(root)], env=cli_env(),
+                                    text=True, capture_output=True, timeout=2)
+            self.assertEqual(result.stdout.strip(), 'True')
+
     def test_started_verification_journal_prevents_repetition_before_pid_is_recorded(self):
         from nightshift.models import empty_run
         from nightshift.supervisor import probe_run, classify_recovery

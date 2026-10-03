@@ -130,10 +130,11 @@ class GrokProvider:
 def _completion_reason(path: Path) -> str | None:
     """Inspect bounded retained stream events; shell exit zero is insufficient."""
     from nightshift.providers.base import MAX_LOG_BYTES, MAX_LINE_BYTES
+    from nightshift.priv import read_private_bytes
+    from nightshift.models import NightshiftError
     try:
-        with path.open('rb') as handle:
-            data = handle.read(MAX_LOG_BYTES + 1)
-    except OSError:
+        data = read_private_bytes(path, max_bytes=MAX_LOG_BYTES + 1)
+    except (OSError, NightshiftError):
         return None
     if len(data) > MAX_LOG_BYTES:
         return None

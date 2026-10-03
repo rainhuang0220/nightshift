@@ -49,6 +49,25 @@ def open_private_binary(path: Path):
     return os.fdopen(fd, "ab", buffering=0)
 
 
+def read_private_bytes(path: Path, *, max_bytes: int) -> bytes:
+    """Bounded read that cannot follow a final symlink or block opening a FIFO."""
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NightshiftError(f'refusing to read a non-regular control file: {path.name}')
+        with os.fdopen(fd, 'rb') as handle:
+            fd = -1
+            return handle.read(max_bytes)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def chmod_private_file(path: Path) -> None:
     """Set mode 0600 on a regular file. A symlink is refused and left alone."""
     info = _lstat(path)

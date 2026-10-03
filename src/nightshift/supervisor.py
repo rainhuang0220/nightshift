@@ -151,13 +151,13 @@ def probe_run(run: RunRecord) -> ProcessProbe:
     if run.run_dir:
         from nightshift.runtime import attempt_dir
         journal = attempt_dir(Path(run.run_dir), run.attempt) / 'verification-results.json'
-        if journal.exists():
+        if os.path.lexists(journal):
             try:
-                with journal.open('rb') as handle:
-                    raw = handle.read(1024 * 1024 + 1)
+                from nightshift.priv import read_private_bytes
+                raw = read_private_bytes(journal, max_bytes=1024 * 1024 + 1)
                 records = json.loads(raw) if len(raw) <= 1024 * 1024 else None
                 started = not isinstance(records, list) or bool(records)
-            except (OSError, ValueError):
+            except (OSError, ValueError, NightshiftError):
                 started = True  # Unknown durable intent never authorizes repeating a check.
     return ProcessProbe(alive=alive, workspace_exists=exists, verification_started=started)
 
