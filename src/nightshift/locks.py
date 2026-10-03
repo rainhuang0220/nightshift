@@ -129,6 +129,16 @@ class LockManager:
         self.db.release_locks(run_id)
 
 
+def lock_holder_alive(holder, controller_pid: int | None) -> bool:
+    """A surviving phase keeps its locks even if the controller disappeared."""
+    from nightshift.models import TERMINAL_STATES
+    if holder is None:
+        return False
+    if phase_process_alive(holder.process_meta or {}, fallback_pid=holder.pid):
+        return True
+    return holder.state not in {state.value for state in TERMINAL_STATES} and pid_alive(controller_pid)
+
+
 from contextlib import contextmanager
 import fcntl
 from pathlib import Path

@@ -160,9 +160,8 @@ def _acquire_locks_conn(conn: sqlite3.Connection, keys: list[str], run_id: str, 
     Stale rows are removed only after every key has been classified. Same-run
     ownership is refreshed in place.
     """
-    from nightshift.locks import pid_alive
+    from nightshift.locks import lock_holder_alive
 
-    terminal = {state.value for state in TERMINAL_STATES}
     stale: list[str] = []
     for key in keys:
         row = conn.execute(
@@ -171,9 +170,8 @@ def _acquire_locks_conn(conn: sqlite3.Connection, keys: list[str], run_id: str, 
         ).fetchone()
         if row is None or row["run_id"] == run_id:
             continue
-        holder = conn.execute("SELECT state FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()
-        holder_terminal = holder is None or holder["state"] in terminal
-        if holder_terminal or not pid_alive(row["pid"]):
+        holder = conn.execute("SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()
+        if not lock_holder_alive(_row_to_run(holder) if holder else None, row["pid"]):
             stale.append(key)
             continue
         return False

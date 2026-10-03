@@ -111,21 +111,18 @@ def _locks_available(db: Database, keys: list[str], run_id: str) -> bool:
     """Read-only classification. Stale rows are removed later by the shared acquire."""
     if not keys:
         return True
-    from nightshift.locks import pid_alive
-    from nightshift.models import TERMINAL_STATES
+    from nightshift.locks import lock_holder_alive
 
     marks = ",".join("?" for _ in keys)
     rows = db._conn.execute(
         f"SELECT lock_key, run_id, pid FROM locks WHERE lock_key IN ({marks})",
         keys,
     ).fetchall()
-    terminal_values = {state.value for state in TERMINAL_STATES}
     for row in rows:
         if row["run_id"] == run_id:
             continue
         holder = db._fetch(row["run_id"])
-        stale = holder is None or holder.state in terminal_values or not pid_alive(row["pid"])
-        if stale:
+        if not lock_holder_alive(holder, row["pid"]):
             continue
         return False
     return True

@@ -151,6 +151,7 @@ def _execute_run(
         if not is_git_repo(repo):
             raise RunBlocked(f"repository is not available: {repo}")
         dest = _workspace_dest(config, run)
+        _execution_preflight(config, job, repo, dest)
         keys = [group_key(job.concurrency_group), repo_key(str(repo)), workspace_key(str(dest))]
         if not locks.acquire(keys, run_id):
             raise RunBlocked(f"lock held for concurrency group {job.concurrency_group} or repository {repo}")
@@ -774,6 +775,42 @@ def _resolve_run_file(run_dir: Path, attempt: int, name: str) -> Path:
     return current
 
 
+def _execution_preflight(config: Config, job: Job, repo: Path, dest: Path) -> None:
+    """Check prerequisites before allocating an isolated checkout."""
+    from nightshift.intake import reject_control_plane
+    from nightshift.work_order import WorkOrderError
+    try:
+        reject_control_plane(repo)
+    except WorkOrderError as exc:
+        raise RunBlocked(str(exc)) from exc
+    source = repo.resolve()
+    for control in (config.state_dir, config.runs_dir, config.worktrees_dir, dest):
+        path = control.resolve()
+        if source == path or source in path.parents or path in source.parents:
+            raise RunBlocked('source repository and control/workspace paths must not overlap')
+    if dest.exists() or dest.is_symlink():
+        raise RunBlocked(f'workspace destination already exists: {dest}')
+    if not sandbox_available():
+        raise RunBlocked('sandbox-exec is not available; refusing to run unsandboxed')
+    if shutil.disk_usage(config.worktrees_dir).free < 64 * 1024 * 1024:
+        raise RunBlocked('less than 64 MiB free for an isolated workspace')
+    if job.provider == 'grok' and shutil.which('grok') is None:
+        raise RunBlocked('grok CLI is not available')
+    for step in verification_plan(job):
+        argv = step.get('argv')
+        if not argv:
+            continue
+        executable = argv[0]
+        if '/' not in executable:
+            available = shutil.which(executable) is not None
+        else:
+            path = Path(executable)
+            path = path if path.is_absolute() else repo / path
+            available = path.is_file() and os.access(path, os.X_OK)
+        if not available:
+            raise RunBlocked(f'verification executable is unavailable: {executable}')
+
+
 def _mark_phase(
     db: Database,
     run_id: str,
@@ -794,6 +831,8 @@ def _mark_phase(
             "pgid": pgid,
             "match": match,
             "identity": identity,
+            "controller_pid": os.getpid(),
+            "controller_identity": process_start_token(os.getpid()),
         },
     )
 

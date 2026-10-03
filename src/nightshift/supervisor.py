@@ -14,7 +14,7 @@ from pathlib import Path
 
 from nightshift.config import Config
 from nightshift.db import Database
-from nightshift.locks import LockManager, phase_process_alive, process_matches
+from nightshift.locks import LockManager, phase_process_alive, process_matches, process_identity_matches
 from nightshift.models import (
     RETRYABLE_STATES,
     TERMINAL_STATES,
@@ -159,7 +159,28 @@ def recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -
 def _recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:
     run = db.require_run(run_id)
     probe = probe_run(run)
-    decision = classify_recovery(run, probe)
+    meta = run.process_meta or {}
+    # The lease has been acquired. Only new records with an identified, dead
+    # controller authorize stopping a surviving identified child. Legacy live
+    # workers remain noninvasive; a recycled PID never authorizes a signal.
+    orphan = (probe.alive and meta.get('controller_identity') and
+              not process_identity_matches(meta.get('controller_pid'), meta.get('controller_identity')) and
+              meta.get('phase') in {'provider', 'verifying', 'inspect'} and
+              process_identity_matches(meta.get('pid'), meta.get('identity')))
+    if orphan:
+        pid = meta['pid']
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            group = None
+        terminate_process(pid, group if group == meta.get('pgid') else None)
+        if probe_run(run).alive:
+            return run, RecoveryDecision('orphan_stop_unconfirmed', 'leave', None,
+                                         'identified orphan could not be stopped; locks retained', False)
+        decision = RecoveryDecision('controller_gone_child_stopped', 'mark', RunState.INTERRUPTED.value,
+                                    'controller disappeared; owned child stopped; provider not relaunched', False)
+    else:
+        decision = classify_recovery(run, probe)
     if decision.launch_provider:
         raise NightshiftError("recover refused to launch a provider")
     # A live phase is left alone. Auth cleanup before this check deletes the
