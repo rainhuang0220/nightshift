@@ -171,9 +171,11 @@ class Job:
     isolation: str = "clone"
     allow_legacy_shell: bool = False
     verification_steps: list = field(default_factory=list)
+    work_order: dict | None = None
 
     def to_dict(self) -> dict:
         return {
+            "work_order": self.work_order,
             "schema_version": self.schema_version,
             "id": self.id,
             "description": self.description,
@@ -202,6 +204,7 @@ class Job:
     @classmethod
     def from_dict(cls, data: dict) -> "Job":
         return cls(
+            work_order=data.get("work_order"),
             schema_version=int(data["schema_version"]),
             id=str(data["id"]),
             description=str(data["description"]),
