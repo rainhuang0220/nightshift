@@ -36,10 +36,6 @@ def main(argv: list[str] | None = None) -> int:
         _git(["add", "nightshift-notes/result.md"])
         _git(
             [
-                "-c",
-                "user.email=nightshift@localhost",
-                "-c",
-                "user.name=Nightshift",
                 "commit",
                 "-m",
                 "nightshift: record fake provider note",

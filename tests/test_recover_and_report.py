@@ -152,6 +152,8 @@ class FakeProviderTests(unittest.TestCase):
             self.assertTrue((repo / "nightshift-notes" / "result.md").is_file())
             log = subprocess.check_output(["git", "-C", str(repo), "log", "--format=%s"], text=True)
             self.assertIn("nightshift: record fake provider note", log)
+            author = subprocess.check_output(['git', '-C', str(repo), 'log', '-1', '--format=%an <%ae>'], text=True)
+            self.assertEqual(author.strip(), 'Test User <test@example.com>')
 
     def test_failure_keeps_findings_and_skips_the_commit(self) -> None:
         import os
