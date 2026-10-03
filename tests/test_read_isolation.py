@@ -652,8 +652,8 @@ class RuntimeProfileTests(unittest.TestCase):
 
 
 class WordingTests(unittest.TestCase):
-    def test_version_is_0_2_1_and_stale_strings_are_gone(self) -> None:
-        self.assertEqual(nightshift.__version__, "0.2.1")
+    def test_version_is_0_3_0_and_stale_strings_are_gone(self) -> None:
+        self.assertEqual(nightshift.__version__, "0.3.0")
         with tempfile.TemporaryDirectory() as raw:
             job_dir = Path(raw)
             (job_dir / "prompt.md").write_text("look\n", encoding="utf-8")

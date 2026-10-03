@@ -6,7 +6,22 @@ It exists so a long model session can work while you are away without becoming a
 
 This repository is the control plane. It does not vendor a target project. Point a job at a repository when you are ready.
 
-**Status: 0.2.1, alpha.** The supported host is macOS with Python 3.11+ and `/usr/bin/sandbox-exec`. The sacrificial Grok canary is `PASS_WITH_LIMITATIONS`. Nightshift does not merge, push, or install a system service.
+**Status: 0.3.0 development candidate, alpha; not tagged or released.** The supported host is macOS with Python 3.11+ and `/usr/bin/sandbox-exec`. The sacrificial Grok canary is `PASS_WITH_LIMITATIONS`. Nightshift does not merge, push, or install a system service.
+
+## Import a generic engineering work order
+
+```bash
+nightshift work-order validate order.json
+nightshift work-order preview order.json --provider grok
+nightshift work-order import order.json --provider grok
+nightshift work-order import order.json --provider grok --run
+```
+
+Validation and preview do not create state. Intake pins the local source revision and retains the entire [v1 manifest](docs/work-order-v1.md); Foreshadow is optional and never imported. The same task and settings return the same run; conflicting reuse of an ID is rejected. Repeating `--run` does not execute a terminal run again. Unsupported versions, stale evidence, missing executables, unsafe path overlap and recursive control-plane targets fail closed.
+
+Each attempt records per-check argv, exit and elapsed time in `result.json`, alongside `report.md`. Logs are capped at 8 MiB per provider stream and verification log, with whole-line redaction and truncation markers. A per-run kernel lease prevents duplicate controllers. Identified child phases retain resource locks after controller death; recovery may stop a proved orphan and record INTERRUPTED without relaunching the model. Older records with live children remain noninvasive. Cleanup requires a matching ownership receipt. Existing pre-receipt workspaces are retained for manual inspection.
+
+Recovery requires an operator invocation after a killed controller or machine restart. A surviving child has no controller timeout until recovery stops it; there is no background watchdog or disk quota. The 64 MiB preflight is a minimum availability check, not a capacity guarantee. Provider network remains an accepted limitation, and model-writable validation requires review.
 
 ## Architecture
 

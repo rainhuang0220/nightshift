@@ -5,7 +5,17 @@ All notable changes to Nightshift are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Nightshift uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - Unreleased
+
+- Intake generic Engineering Work Order v1 with offline validation/preview, pinned revisions, retained provenance and idempotent task identity.
+- Require ownership receipts for workspace cleanup and preserve the configured human Git author.
+- Persist controller/phase identities, prevent concurrent execution of the same run, retain locks for surviving children and reconcile proved orphans without model continuation.
+- Bound and redact process output, stop remaining group children on leader exit and clean up after callback exceptions.
+- Record actual executed checks, timing and exit results in a separate result manifest; do not repeat interrupted verification automatically.
+- Fail closed on malformed config/job types, unsafe control-plane targets, path overlap, low free space and unavailable verification tools.
+- Require a completed Grok stream rather than trusting a zero process exit after cancellation.
+- No tag or release has been created. Provider network, workspace disk growth, mutable checks and the absence of a background watchdog remain documented limitations.
+
 
 ## [0.2.1] - 2026-10-03
 
