@@ -7,6 +7,7 @@ unless the operator passes `--retry`. Retry stops at max_attempts.
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ RETRYABLE_VALUES = {state.value for state in RETRYABLE_STATES}
 class ProcessProbe:
     alive: bool
     workspace_exists: bool
+    verification_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,9 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
                 "process gone and workspace missing",
                 False,
             )
+        if not run.verification_ran and probe.verification_started:
+            return RecoveryDecision('verification_interrupted', 'mark', RunState.INTERRUPTED.value,
+                                    'verification journal records a started check; commands were not repeated', False)
         if not run.verification_ran:
             return RecoveryDecision(
                 "verification_never_ran",
@@ -110,7 +115,7 @@ def classify_recovery(run: RunRecord, probe: ProcessProbe) -> RecoveryDecision:
                 False,
             )
         if not run.verification_ran:
-            if (run.process_meta or {}).get("phase") == "verifying":
+            if probe.verification_started or (run.process_meta or {}).get("phase") == "verifying":
                 return RecoveryDecision("verification_interrupted", "mark", RunState.INTERRUPTED.value,
                                         "verification started but its result is unknown; commands were not repeated", False)
             return RecoveryDecision(
@@ -142,7 +147,19 @@ def probe_run(run: RunRecord) -> ProcessProbe:
     meta = run.process_meta if isinstance(run.process_meta, dict) else {}
     alive = phase_process_alive(meta, fallback_pid=run.pid)
     exists = bool(run.workspace_path) and Path(run.workspace_path).is_dir()
-    return ProcessProbe(alive=alive, workspace_exists=exists)
+    started = False
+    if run.run_dir:
+        from nightshift.runtime import attempt_dir
+        journal = attempt_dir(Path(run.run_dir), run.attempt) / 'verification-results.json'
+        if journal.exists():
+            try:
+                with journal.open('rb') as handle:
+                    raw = handle.read(1024 * 1024 + 1)
+                records = json.loads(raw) if len(raw) <= 1024 * 1024 else None
+                started = not isinstance(records, list) or bool(records)
+            except (OSError, ValueError):
+                started = True  # Unknown durable intent never authorizes repeating a check.
+    return ProcessProbe(alive=alive, workspace_exists=exists, verification_started=started)
 
 
 def recover_run(config: Config, db: Database, locks: LockManager, run_id: str) -> tuple[RunRecord, RecoveryDecision]:

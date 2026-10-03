@@ -13,6 +13,21 @@ from nightshift.testkit import make_repo, write_job
 
 
 class ControllerLeaseTests(unittest.TestCase):
+    def test_started_verification_journal_prevents_repetition_before_pid_is_recorded(self):
+        from nightshift.models import empty_run
+        from nightshift.supervisor import probe_run, classify_recovery
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            attempt = root / 'attempt-1'
+            attempt.mkdir()
+            (attempt / 'verification-results.json').write_text('[{"index":0,"started_at":"now","exit_code":null}]')
+            run = empty_run(state='VERIFYING', run_dir=str(root), provider_exit_code=0,
+                            verification_ran=False, process_meta={'phase':'provider','pid':99999999})
+            decision = classify_recovery(run, probe_run(run))
+            self.assertEqual(decision.new_state, 'INTERRUPTED')
+            self.assertEqual(decision.action, 'mark')
+            self.assertFalse(decision.launch_provider)
+
     def test_second_controller_and_recovery_cannot_touch_an_owned_attempt(self):
         from nightshift.locks import execution_lease
         with tempfile.TemporaryDirectory() as raw:
