@@ -170,4 +170,7 @@ def load(path: Path) -> dict:
 
 
 def dumps(data: dict) -> str:
-    return json.dumps(validate(data), sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+    text = json.dumps(validate(data), sort_keys=True, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+    if len(text.encode('utf-8')) > MAX_BYTES:
+        raise WorkOrderError('work order is too large; maximum 1 MiB')
+    return text

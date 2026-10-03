@@ -26,6 +26,13 @@ def sample_order():
 
 
 class WorkOrderContractTests(unittest.TestCase):
+    def test_export_cannot_exceed_the_import_byte_budget(self):
+        from nightshift.work_order import WorkOrderError, dumps
+        data = sample_order()
+        data['constraints'] = ['x' * 16000] * 100
+        with self.assertRaisesRegex(WorkOrderError, 'large'):
+            dumps(data)
+
     def test_round_trip_is_canonical_and_independent(self):
         from nightshift.work_order import dumps, loads
         data = sample_order()
