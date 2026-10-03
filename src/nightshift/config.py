@@ -6,6 +6,7 @@ Relative path settings resolve against the Nightshift root. The root is
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,7 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
             data = tomllib.loads(path.read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as exc:
             raise UsageError(f"invalid config {path}: {exc}") from exc
+    _validate_config(data)
     paths = data.get("paths") or {}
     supervisor = data.get("supervisor") or {}
     provider = data.get("provider") or {}
@@ -64,6 +66,13 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
     state_dir = _under_root(chosen_root, paths.get("state_dir") or "state")
     runs_dir = _under_root(chosen_root, paths.get("runs_dir") or "runs")
     worktrees_dir = _under_root(chosen_root, paths.get("worktrees_dir") or "worktrees")
+    locations = [state_dir, runs_dir, worktrees_dir]
+    for index, left in enumerate(locations):
+        if left == chosen_root or left == Path.home().resolve() or left == Path('/'):
+            raise UsageError("state, run and workspace paths must be dedicated directories")
+        for right in locations[index + 1:]:
+            if left == right or left in right.parents or right in left.parents:
+                raise UsageError("state, run and workspace directories must not overlap")
     concurrency = int(supervisor.get("concurrency", 1))
     if concurrency < 1:
         raise UsageError("supervisor.concurrency must be >= 1")
@@ -124,3 +133,43 @@ def _under_root(root: Path, value: str) -> Path:
     if not path.is_absolute():
         path = root / path
     return path.resolve()
+
+
+_CONFIG_KEYS = {
+    "paths": {"state_dir", "runs_dir", "worktrees_dir"},
+    "supervisor": {"concurrency", "poll_interval_seconds"},
+    "provider": {"default", "max_turns", "permission_mode"},
+    "policy": {"destroy_failed_worktrees"},
+    "containment": {"read_roots"},
+}
+
+
+def _validate_config(data: dict) -> None:
+    if set(data) - set(_CONFIG_KEYS) - {"schema_version"}:
+        raise UsageError("unknown config section")
+    if "schema_version" in data and (type(data["schema_version"]) is not int or data["schema_version"] != 1):
+        raise UsageError("config schema_version must be 1")
+    for section, keys in _CONFIG_KEYS.items():
+        value = data.get(section, {})
+        if not isinstance(value, dict) or set(value) - keys:
+            raise UsageError(f"invalid or unknown fields in config.{section}")
+        for key, item in value.items():
+            label = f"{section}.{key}"
+            if key in {"concurrency", "max_turns"}:
+                if type(item) is not int or not 1 <= item <= 1000:
+                    raise UsageError(f"{label} must be an integer in 1..1000")
+            elif key == "poll_interval_seconds":
+                if type(item) not in {int, float} or not math.isfinite(item) or item <= 0:
+                    raise UsageError(f"{label} must be a finite positive number")
+            elif key == "destroy_failed_worktrees":
+                if type(item) is not bool:
+                    raise UsageError(f"{label} must be a boolean")
+            elif key == "read_roots":
+                _read_roots(Path.cwd(), item)
+            elif not isinstance(item, str) or not item.strip() or "\x00" in item:
+                raise UsageError(f"{label} must be a nonempty path/string")
+    provider = data.get("provider", {})
+    if provider.get("default", "grok") not in {"fake", "grok"}:
+        raise UsageError("provider.default must be fake or grok")
+    if provider.get("permission_mode", "dontAsk") != "dontAsk":
+        raise UsageError("provider.permission_mode must be dontAsk")

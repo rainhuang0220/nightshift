@@ -125,7 +125,7 @@ def _validate(data: dict) -> list[str]:
             errors.append(f"missing required field {key!r}")
     if errors:
         return errors
-    if data["schema_version"] != 1:
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         errors.append("schema_version must be 1")
     if not isinstance(data["id"], str) or not _ID_RE.match(data["id"]):
         errors.append("id must match [A-Za-z0-9][A-Za-z0-9._-]{0,80}")
@@ -140,7 +140,7 @@ def _validate(data: dict) -> list[str]:
     provider = data["provider"]
     if provider == "cursor":
         errors.append("provider 'cursor' is not implemented")
-    elif provider not in _PROVIDERS:
+    elif not isinstance(provider, str) or provider not in _PROVIDERS:
         errors.append("provider must be 'grok' or 'fake'")
     if "model" in data and data["model"] is not None and not isinstance(data["model"], str):
         errors.append("model must be a string when set")
@@ -150,9 +150,9 @@ def _validate(data: dict) -> list[str]:
         errors.append("concurrency_group must be a non-empty string")
     if not isinstance(data["network"], bool):
         errors.append("network must be a boolean")
-    if data["write_scope"] not in _WRITE_SCOPES:
+    if not isinstance(data["write_scope"], str) or data["write_scope"] not in _WRITE_SCOPES:
         errors.append("write_scope must be 'none' or 'workspace'")
-    if "isolation" in data and data["isolation"] not in _ISOLATION:
+    if "isolation" in data and (not isinstance(data["isolation"], str) or data["isolation"] not in _ISOLATION):
         errors.append("isolation must be 'clone' or 'worktree'")
     if "allow_legacy_shell_verification" in data and not isinstance(data["allow_legacy_shell_verification"], bool):
         errors.append("allow_legacy_shell_verification must be a boolean")
