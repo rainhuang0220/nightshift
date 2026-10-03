@@ -14,6 +14,7 @@ emitted. The seatbelt is the containment.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 from pathlib import Path
 
@@ -103,7 +104,7 @@ class GrokProvider:
         if shutil.which(self.binary) is None and not Path(self.binary).is_file():
             return ProviderResult(exit_code=127, failure_reason=f"grok CLI not found: {self.binary}")
         argv = self.build_argv(request, policy, resume=bool(request.resume))
-        return run_subprocess(
+        result = run_subprocess(
             argv,
             cwd=request.workspace,
             env=request.env,
@@ -115,6 +116,35 @@ class GrokProvider:
             heartbeat=heartbeat,
             containment_profile=request.containment_profile,
         )
+        if result.exit_code == 0:
+            reason = _completion_reason(request.stdout_path)
+            if reason not in {'completed', 'stop', 'end_turn'}:
+                result.exit_code = 1
+                result.failure_reason = f'Grok completion was not confirmed: {reason or "missing end event"}'
+        return result
 
     def terminate(self, pid: int | None, pgid: int | None = None) -> None:
         terminate_process(pid, pgid)
+
+
+def _completion_reason(path: Path) -> str | None:
+    """Inspect bounded retained stream events; shell exit zero is insufficient."""
+    from nightshift.providers.base import MAX_LOG_BYTES, MAX_LINE_BYTES
+    try:
+        with path.open('rb') as handle:
+            data = handle.read(MAX_LOG_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_LOG_BYTES:
+        return None
+    reason = None
+    for line in data.splitlines():
+        if len(line) > MAX_LINE_BYTES:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(event, dict) and event.get('type') == 'end':
+            reason = event.get('stopReason')
+    return reason if isinstance(reason, str) else None
