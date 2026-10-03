@@ -34,6 +34,15 @@ class InvalidInputTests(unittest.TestCase):
                 with self.subTest(text=text), self.assertRaises(UsageError):
                     load_config(root, config)
 
+    def test_read_roots_reject_blank_non_array_and_control_directory_overlap(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / 'nightshift.toml'
+            for value in ('[""]', '[" "]', '""', '["."]', '["state"]', '["state/credentials"]', '["/"]'):
+                config.write_text('[containment]\nread_roots=' + value + '\n')
+                with self.subTest(value=value), self.assertRaises(UsageError):
+                    load_config(root, config)
+
     def test_intake_refuses_recursive_control_plane_targets(self):
         from nightshift.intake import plan_order
         from nightshift.work_order import WorkOrderError

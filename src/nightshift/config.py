@@ -92,6 +92,10 @@ def load_config(root: Path | None = None, config_path: Path | None = None) -> Co
             "refusing permission_mode that bypasses approvals; Nightshift uses dontAsk plus deny rules"
         )
     read_roots = _read_roots(chosen_root, containment.get("read_roots") or [])
+    for read_root in read_roots:
+        for control in locations:
+            if read_root == control or read_root in control.parents or control in read_root.parents:
+                raise UsageError('containment.read_roots must not overlap private control directories')
     return Config(
         root=chosen_root,
         state_dir=state_dir,
@@ -128,9 +132,10 @@ def _discover_config(root: Path, explicit: Path | None) -> Path | None:
 
 def _read_roots(root: Path, value) -> tuple[Path, ...]:
     """Operator-configured toolchain roots. A job prompt cannot add these."""
-    if value in (None, "", []):
+    if value is None or value == []:
         return ()
-    if not isinstance(value, list) or any(isinstance(item, bool) or not isinstance(item, str) for item in value):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() or '\x00' in item
+                                          for item in value):
         raise UsageError("containment.read_roots must be a list of path strings")
     return tuple(_under_root(root, item) for item in value)
 
