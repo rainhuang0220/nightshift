@@ -193,7 +193,9 @@ def _pump(stream, handle, limit: int, errors: list[str]) -> None:
 
     try:
         while True:
-            chunk = stream.read(8192)
+            # BufferedReader.read waits for a full buffer; read1 exposes small
+            # flushed progress lines while the child is still running.
+            chunk = stream.read1(8192)
             if not chunk:
                 break
             text = decoder.decode(chunk)
