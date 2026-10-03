@@ -163,6 +163,8 @@ def build_policy(job: Job, *, permission_mode: str = "dontAsk") -> Policy:
     if job.network:
         allow = allow + NETWORK_ALLOW
     deny = DENY_RULES
+    if job.work_order and "commit" not in job.work_order["actions"]["allowed"]:
+        deny += ("Bash(git commit*)",)
     if job.write_scope == "workspace" and job.repository:
         # Extra Grok-level denies for the source checkout. These are tool-call
         # filters. The isolated clone and the seatbelt are the containment.
@@ -255,6 +257,8 @@ def scrub_text(text: str) -> str:
     Arbitrary repository content can contain secret formats this pattern does
     not recognize. Logs stay on disk; they are not deleted after redaction.
     """
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*)(?:bearer|basic)\s+\S+", r"\1[redacted]", text)
+    text = re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})", "[redacted]", text)
     text = re.sub(
         r"(?i)([\"']?(?:api[_-]?key|token|secret|password|authorization)[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|\S+)",
         r"\1[redacted]",
@@ -267,3 +271,14 @@ def package_pythonpath() -> str:
     import nightshift
 
     return str(Path(nightshift.__file__).resolve().parent.parent)
+
+
+def scrub_data(value):
+    """Scrub string values before JSON encoding, preserving valid JSON."""
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, list):
+        return [scrub_data(item) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub_data(item) for key, item in value.items()}
+    return value

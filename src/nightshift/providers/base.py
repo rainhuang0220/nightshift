@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import signal
 import subprocess
@@ -42,6 +43,9 @@ class ProviderResult:
     argv: list[str] = field(default_factory=list)
 
 
+MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 64 * 1024
+
 StopCheck = Callable[[], str | None]
 
 
@@ -54,6 +58,9 @@ def terminate_process(pid: int | None, pgid: int | None = None) -> None:
     _signal(pid, target_group, signal.SIGTERM)
     for _ in range(25):
         if not _alive(pid):
+            # The leader may have exited while descendants keep the group alive.
+            if target_group is not None:
+                _signal(pid, target_group, signal.SIGKILL)
             return
         time.sleep(0.1)
     _signal(pid, target_group, signal.SIGKILL)
@@ -71,30 +78,36 @@ def run_subprocess(
     poll_stop: StopCheck | None = None,
     heartbeat: Callable[[], None] | None = None,
     containment_profile: Path | None = None,
+    max_output_bytes: int = MAX_LOG_BYTES,
 ) -> ProviderResult:
+    if max_output_bytes < 128:
+        raise ValueError("max_output_bytes must be at least 128")
+    # Open logs before launch; a symlink or unwritable log fails closed.
+    handles = [open_private_binary(stdout_path), open_private_binary(stderr_path)]
     launched = list(argv)
     if containment_profile is not None:
         sandbox = Path("/usr/bin/sandbox-exec")
         if not sandbox.is_file():
+            for handle in handles:
+                handle.close()
             return ProviderResult(
                 exit_code=127,
                 failure_reason="sandbox-exec is required and was not found",
                 argv=launched,
             )
         launched = [str(sandbox), "-f", str(containment_profile), *launched]
-    stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        launched,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    pumps = [
-        threading.Thread(target=_pump, args=(proc.stdout, stdout_path), daemon=True),
-        threading.Thread(target=_pump, args=(proc.stderr, stderr_path), daemon=True),
-    ]
+    try:
+        proc = subprocess.Popen(
+            launched, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except BaseException:
+        for handle in handles:
+            handle.close()
+        raise
+    errors: list[str] = []
+    pumps = [threading.Thread(target=_pump, args=(stream, handle, max_output_bytes, errors), daemon=True)
+             for stream, handle in zip((proc.stdout, proc.stderr), handles)]
     for pump in pumps:
         pump.start()
     try:
@@ -102,15 +115,23 @@ def run_subprocess(
     except ProcessLookupError:
         pgid = None
     if on_pid is not None:
-        on_pid(proc.pid, pgid)
+        try:
+            on_pid(proc.pid, pgid)
+        except BaseException:
+            terminate_process(proc.pid, pgid)
+            proc.wait()
+            _join_pumps(pumps)
+            raise
     deadline = time.monotonic() + max(timeout, 0.1)
     next_beat = time.monotonic() + 5
     stop_reason = None
     while True:
         code = proc.poll()
         if code is not None:
+            terminate_process(proc.pid, pgid)
             _join_pumps(pumps)
-            return ProviderResult(exit_code=code, pid=proc.pid, pgid=pgid, argv=launched)
+            return ProviderResult(exit_code=code if not errors else 125, pid=proc.pid, pgid=pgid,
+                                  failure_reason="log capture failed" if errors else None, argv=launched)
         now = time.monotonic()
         if poll_stop is not None:
             stop_reason = poll_stop()
@@ -139,23 +160,58 @@ def run_subprocess(
     )
 
 
-def _pump(stream, path: Path) -> None:
-    if stream is None:
-        return
+def _pump(stream, handle, limit: int, errors: list[str]) -> None:
+    """Drain every byte; persist bounded, complete redacted lines.
+
+    Oversized lines are suppressed as a whole, so splitting a credential at
+    the limit cannot expose its suffix. UTF-8 decoding is incremental.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    dropping = False
+    marker = b"\n[nightshift: output truncated]\n"
+    budget = max(0, limit - handle.tell() - len(marker))
+    written = 0
+    truncated = False
+
+    def emit(line: str) -> None:
+        nonlocal written, truncated
+        data = scrub_text(line).encode("utf-8")
+        available = budget - written
+        if len(data) > available:
+            # Never persist a partial line with a partial redaction.
+            truncated = True
+            return
+        handle.write(data)
+        written += len(data)
+
     try:
-        with open_private_binary(path) as handle:
-            while True:
-                chunk = stream.read(8192)
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", "replace")
-                handle.write(scrub_text(text).encode("utf-8"))
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            for piece in text.splitlines(keepends=True):
+                if not dropping:
+                    pending += piece
+                    if len(pending) > MAX_LINE_BYTES:
+                        pending = ""
+                        dropping = True
+                        truncated = True
+                if piece.endswith(("\n", "\r")):
+                    if not dropping:
+                        emit(pending)
+                    pending = ""
+                    dropping = False
+        if not dropping:
+            emit(pending + decoder.decode(b"", final=True))
+        if truncated:
+            handle.write(marker)
     except Exception:
-        return
-    try:
+        errors.append("log capture failed")
+    finally:
+        handle.close()
         stream.close()
-    except Exception:
-        return
 
 
 def _join_pumps(pumps: list[threading.Thread]) -> None:

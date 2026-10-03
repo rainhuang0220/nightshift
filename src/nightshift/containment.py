@@ -17,15 +17,14 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
-import time
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from nightshift.policy import scrub_text
 from nightshift.priv import write_private_text
-from nightshift.providers.base import terminate_process
+from nightshift.providers.base import run_subprocess
 
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 
@@ -283,63 +282,26 @@ def contained_argv(argv: list[str], profile: Path | None) -> list[str]:
 
 
 def contained_run(
-    argv: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    profile: Path,
-    timeout: float,
-    poll_stop: Callable[[], str | None] | None = None,
+    argv: list[str], *, cwd: Path, env: dict[str, str], profile: Path,
+    timeout: float, poll_stop: Callable[[], str | None] | None = None,
     on_pid: Callable[[int, int | None], None] | None = None,
+    max_output_bytes: int = 1024 * 1024,
 ) -> tuple[int, str]:
-    """Run argv under the profile. Timeout or poll_stop kills the child group."""
-    full = contained_argv(argv, profile)
-    proc = subprocess.Popen(
-        full,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        pgid = None
-    if on_pid is not None:
-        on_pid(proc.pid, pgid)
-    if poll_stop is not None:
-        watcher = threading.Thread(target=_stop_watcher, args=(proc, pgid, poll_stop), daemon=True)
-        watcher.start()
-    else:
-        watcher = None
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        terminate_process(proc.pid, pgid)
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = "", ""
-        output = scrub_text((stdout or "") + (stderr or "") + "verification timed out\n")
-        return 124, output
-    finally:
-        if watcher is not None:
-            watcher.join(timeout=1)
-    output = scrub_text((stdout or "") + (stderr or ""))
-    code = proc.returncode if proc.returncode is not None else 1
-    if poll_stop is not None and poll_stop() and code not in {0}:
-        output += "cancelled\n"
-    return code, output
-
-
-def _stop_watcher(proc: subprocess.Popen[str], pgid: int | None, poll_stop: Callable[[], str | None]) -> None:
-    while proc.poll() is None:
-        if poll_stop():
-            terminate_process(proc.pid, pgid)
-            return
-        time.sleep(0.05)
+    """Verification and preflight share bounded process supervision."""
+    with tempfile.TemporaryDirectory(prefix="nightshift-output-") as raw:
+        root = Path(raw)
+        stdout, stderr = root / "stdout", root / "stderr"
+        result = run_subprocess(
+            argv, cwd=cwd, env=env, stdout_path=stdout, stderr_path=stderr,
+            timeout=timeout, poll_stop=poll_stop, on_pid=on_pid,
+            containment_profile=profile, max_output_bytes=max_output_bytes,
+        )
+        output = stdout.read_text(encoding="utf-8", errors="replace") + stderr.read_text(encoding="utf-8", errors="replace")
+        if result.failure_reason == "timed out":
+            return 124, output + "verification timed out\n"
+        if result.failure_reason:
+            output += result.failure_reason + "\n"
+        return result.exit_code, output
 
 
 def _ancestor_metadata_lines(roots: list[Path]) -> list[str]:

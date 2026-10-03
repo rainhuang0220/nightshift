@@ -1132,4 +1132,7 @@ def _parse_utc(value: str) -> datetime:
 def _read(path: Path) -> str:
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8", errors="replace")
+    with path.open("rb") as handle:
+        raw = handle.read(8 * 1024 * 1024 + 1)
+    suffix = "\n[nightshift: report input truncated]\n" if len(raw) > 8 * 1024 * 1024 else ""
+    return raw[:8 * 1024 * 1024].decode("utf-8", "replace") + suffix
