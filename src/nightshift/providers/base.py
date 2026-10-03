@@ -122,42 +122,48 @@ def run_subprocess(
             proc.wait()
             _join_pumps(pumps)
             raise
-    deadline = time.monotonic() + max(timeout, 0.1)
-    next_beat = time.monotonic() + 5
-    stop_reason = None
-    while True:
-        code = proc.poll()
-        if code is not None:
-            terminate_process(proc.pid, pgid)
-            _join_pumps(pumps)
-            return ProviderResult(exit_code=code if not errors else 125, pid=proc.pid, pgid=pgid,
-                                  failure_reason="log capture failed" if errors else None, argv=launched)
-        now = time.monotonic()
-        if poll_stop is not None:
-            stop_reason = poll_stop()
-            if stop_reason:
-                break
-        if now >= deadline:
-            stop_reason = "timeout"
-            break
-        if heartbeat is not None and now >= next_beat:
-            heartbeat()
-            next_beat = now + 5
-        time.sleep(0.2)
-    terminate_process(proc.pid, pgid)
     try:
-        code = proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        code = -9
-    _join_pumps(pumps)
-    reason = "timed out" if stop_reason == "timeout" else stop_reason
-    return ProviderResult(
-        exit_code=code if code is not None else -1,
-        pid=proc.pid,
-        pgid=pgid,
-        failure_reason=reason,
-        argv=launched,
-    )
+        deadline = time.monotonic() + max(timeout, 0.1)
+        next_beat = time.monotonic() + 5
+        stop_reason = None
+        while True:
+            code = proc.poll()
+            if code is not None:
+                terminate_process(proc.pid, pgid)
+                _join_pumps(pumps)
+                return ProviderResult(exit_code=code if not errors else 125, pid=proc.pid, pgid=pgid,
+                                      failure_reason="log capture failed" if errors else None, argv=launched)
+            now = time.monotonic()
+            if poll_stop is not None:
+                stop_reason = poll_stop()
+                if stop_reason:
+                    break
+            if now >= deadline:
+                stop_reason = "timeout"
+                break
+            if heartbeat is not None and now >= next_beat:
+                heartbeat()
+                next_beat = now + 5
+            time.sleep(0.2)
+        terminate_process(proc.pid, pgid)
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            code = -9
+        _join_pumps(pumps)
+        reason = "timed out" if stop_reason == "timeout" else stop_reason
+        return ProviderResult(
+            exit_code=code if code is not None else -1,
+            pid=proc.pid,
+            pgid=pgid,
+            failure_reason=reason,
+            argv=launched,
+        )
+    except BaseException:
+        terminate_process(proc.pid, pgid)
+        proc.wait(timeout=5)
+        _join_pumps(pumps)
+        raise
 
 
 def _pump(stream, handle, limit: int, errors: list[str]) -> None:
