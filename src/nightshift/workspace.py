@@ -16,6 +16,7 @@ never stashes, resets, cleans, or checks out the source working tree.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -82,6 +83,7 @@ def create_worktree(snapshot: SourceSnapshot, dest: Path) -> Path:
     dest = _fresh_dest(snapshot, dest)
     add_detached_worktree(snapshot.repo, dest, snapshot.revision)
     assert_unchanged(snapshot)
+    _record_owner(snapshot, dest, "worktree")
     return dest
 
 
@@ -153,12 +155,17 @@ class CloneWorkspaceBackend(WorkspaceBackend):
         hooks = dest / ".git" / "nightshift-hooks"
         hooks.mkdir(parents=True, exist_ok=True)
         run_git(dest, ["config", "--local", "core.hooksPath", str(hooks)])
-        run_git(dest, ["config", "--local", "user.email", "nightshift@localhost"])
-        run_git(dest, ["config", "--local", "user.name", "Nightshift"])
+        for key in ("user.name", "user.email"):
+            value = run_git(snapshot.repo, ["config", "--get", key], check=False).stdout.strip()
+            if not value:
+                raise WorkspaceError(f"source has no configured {key}; configure a human identity before running")
+            run_git(dest, ["config", "--local", key, value])
         run_git(dest, ["config", "--local", "commit.gpgsign", "false"])
+        _record_owner(snapshot, dest, "clone")
         return dest
 
     def cleanup(self, source: Path, dest: Path) -> None:
+        _check_owner(source, dest, "clone")
         dest = dest.resolve()
         source = source.resolve()
         if dest == source or inside(source, dest) or inside(dest, source):
@@ -183,6 +190,7 @@ class WorktreeWorkspaceBackend(WorkspaceBackend):
         return create_worktree(snapshot, dest)
 
     def cleanup(self, source: Path, dest: Path) -> None:
+        _check_owner(source, dest, "worktree")
         subprocess.run(
             [GIT_BIN, "-C", str(source), "worktree", "remove", "--force", str(dest)],
             check=False,
@@ -204,3 +212,38 @@ def _fresh_dest(snapshot: SourceSnapshot, dest: Path) -> Path:
     if inside(dest, snapshot.repo) or inside(snapshot.repo, dest):
         raise WorkspaceError("workspace must not overlap the source repository")
     return dest
+
+
+def _owner_path(dest: Path) -> Path:
+    raw = run_git(dest, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    return Path(raw) / "nightshift-owner.json"
+
+
+def _record_owner(snapshot: SourceSnapshot, dest: Path, isolation: str) -> None:
+    from nightshift.priv import write_private_text
+
+    write_private_text(_owner_path(dest), json.dumps({
+        "version": 1, "source": str(snapshot.repo.resolve()),
+        "workspace": str(dest.resolve()), "isolation": isolation,
+        "revision": snapshot.revision,
+    }, sort_keys=True) + "\n")
+
+
+def _check_owner(source: Path, dest: Path, isolation: str) -> None:
+    # Old and incomplete workspaces have no receipt and require manual review.
+    if dest.is_symlink():
+        raise WorkspaceError("refusing cleanup through a workspace symlink")
+    if not dest.exists():
+        return
+    if any(parent.is_symlink() for parent in dest.parents):
+        raise WorkspaceError("refusing cleanup through a symlinked parent")
+    try:
+        receipt = _owner_path(dest)
+        if receipt.is_symlink():
+            raise ValueError("symlinked receipt")
+        data = json.loads(receipt.read_text(encoding="utf-8"))
+        if (data.get("version") != 1 or data.get("source") != str(source.resolve())
+                or data.get("workspace") != str(dest.resolve()) or data.get("isolation") != isolation):
+            raise ValueError("ownership mismatch")
+    except Exception as exc:
+        raise WorkspaceError("workspace ownership cannot be proven; preserving files") from exc
