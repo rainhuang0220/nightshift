@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,3 +35,24 @@ jobs:
           python -m pip install --no-deps dist/*.whl
           nightshift version
           nightshift work-order --help
+
+  task-lifetime-release-gate:
+    name: macOS whole-task lifetime release gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Enforce the real macOS lifetime invariant
+        env:
+          PYTHONPATH: src
+          NIGHTSHIFT_FORBID_GROK: "1"
+        run: python tests/macos/task_lifetime_gate.py --evidence task-lifetime-gate.json
+      - name: Retain the gate evidence even when the invariant fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-task-lifetime-gate
+          path: task-lifetime-gate.json
+          if-no-files-found: error
